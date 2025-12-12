@@ -1,0 +1,244 @@
+# Ryoshi Field Mapping Configuration
+# Maps common email log fields across different platforms and log sources
+
+# This file helps normalize field names from different email systems
+# to Ryoshi's standard field names used in detection rules
+
+# Standard Ryoshi Field Names
+standard_fields:
+  # Message Identification
+  message_id: "Unique identifier for the email message"
+  conversation_id: "Thread or conversation identifier"
+  internet_message_id: "RFC 2822 Message-ID header"
+  
+  # Sender Information
+  sender: "Email address of the sender"
+  sender_display_name: "Display name of the sender"
+  sender_domain: "Domain part of sender email"
+  from_address: "From header email address"
+  reply_to: "Reply-To header email address"
+  
+  # Recipient Information
+  recipient: "Primary recipient email address(es)"
+  recipient_type: "Type of recipient (To, Cc, Bcc)"
+  to_recipients: "To: field recipients"
+  cc_recipients: "Cc: field recipients"
+  bcc_recipients: "Bcc: field recipients"
+  recipient_domain: "Domain of recipient"
+  recipient_domain_type: "Internal or External"
+  
+  # Timestamps
+  date_sent: "When the email was sent"
+  date_received: "When the email was received"
+  timestamp: "General event timestamp"
+  created_time: "Creation timestamp"
+  last_modified_time: "Last modification timestamp"
+  
+  # Email Content
+  subject: "Email subject line"
+  body_preview: "Preview of email body"
+  has_attachments: "Boolean indicating attachments"
+  attachment_count: "Number of attachments"
+  attachment_name: "Filename of attachment(s)"
+  attachment_extension: "File extension of attachment"
+  attachment_size: "Size of attachment in bytes"
+  link_count: "Number of links in email"
+  link_url: "URLs found in email"
+  
+  # Actions and Operations
+  action: "Action performed (Send, Receive, Forward, Delete, etc.)"
+  operation: "Specific operation name"
+  event_type: "Type of event"
+  result_status: "Success or failure status"
+  
+  # Authentication and Access
+  user_id: "User identifier"
+  user_principal_name: "User's UPN"
+  client_ip: "IP address of the client"
+  client_ip_reputation: "Reputation of client IP"
+  user_agent: "User agent string"
+  client_app_id: "Application ID used to access"
+  auth_type: "Authentication method"
+  auth_protocol: "Protocol used for auth"
+  auth_result: "Authentication result"
+  
+  # Mailbox Rules
+  rule_name: "Name of the mailbox rule"
+  rule_id: "Unique identifier for the rule"
+  rule_actions: "Actions performed by the rule"
+  mailbox_rule_action: "Specific mailbox rule action"
+  forwarding_address: "Email address for forwarding"
+  
+  # Security Indicators
+  spf_result: "SPF check result"
+  dkim_result: "DKIM check result"
+  dmarc_result: "DMARC check result"
+  spam_confidence_level: "Spam confidence score"
+  malware_filter_result: "Malware detection result"
+  phish_confidence_level: "Phishing confidence score"
+  
+  # Folder and Location
+  folder_path: "Path to mailbox folder"
+  folder_name: "Name of folder"
+  mailbox_guid: "Unique mailbox identifier"
+  
+  # Geolocation
+  geo_country: "Country of origin"
+  geo_city: "City of origin"
+  geo_coordinates: "Geographic coordinates"
+  geo_distance_km: "Distance between events in km"
+  
+  # Risk and Anomaly Detection
+  risk_level: "Overall risk assessment"
+  user_risk_level: "User-specific risk level"
+  is_anomalous: "Boolean for anomaly detection"
+  impossible_travel: "Boolean for impossible travel detection"
+
+# Platform-Specific Field Mappings
+
+# Office 365 / Microsoft 365 Audit Logs
+office365_unified_audit_log:
+  CreationDate: "timestamp"
+  UserId: "user_id"
+  UserKey: "user_principal_name"
+  Operation: "action"
+  ResultStatus: "result_status"
+  ClientIP: "client_ip"
+  UserAgent: "user_agent"
+  AppId: "client_app_id"
+  
+  # Exchange-specific
+  Item.Subject: "subject"
+  Item.InternetMessageId: "internet_message_id"
+  MailboxOwnerUPN: "user_principal_name"
+  Folder.Path: "folder_path"
+  
+  # Rule-related
+  RuleName: "rule_name"
+  ForwardTo: "forwarding_address"
+  
+# Exchange Server Logs
+exchange_server:
+  Timestamp: "timestamp"
+  Sender: "sender"
+  Recipients: "recipient"
+  MessageSubject: "subject"
+  MessageId: "message_id"
+  ClientIp: "client_ip"
+  ServerHostname: "server_hostname"
+  SourceContext: "source_context"
+  EventId: "event_type"
+  
+# Microsoft Graph API
+microsoft_graph:
+  id: "message_id"
+  subject: "subject"
+  from.emailAddress.address: "sender"
+  toRecipients: "to_recipients"
+  ccRecipients: "cc_recipients"
+  bccRecipients: "bcc_recipients"
+  sentDateTime: "date_sent"
+  receivedDateTime: "date_received"
+  hasAttachments: "has_attachments"
+  attachments: "attachment_name"
+  
+# Azure AD Sign-in Logs
+azure_ad_signin:
+  createdDateTime: "timestamp"
+  userPrincipalName: "user_principal_name"
+  userId: "user_id"
+  appDisplayName: "client_app_id"
+  ipAddress: "client_ip"
+  location.city: "geo_city"
+  location.countryOrRegion: "geo_country"
+  status.errorCode: "error_code"
+  riskDetail: "risk_level"
+  
+# Outlook Desktop Client Logs
+outlook_client:
+  EntryID: "message_id"
+  Subject: "subject"
+  SenderEmailAddress: "sender"
+  ReceivedTime: "date_received"
+  SentOn: "date_sent"
+  To: "to_recipients"
+  CC: "cc_recipients"
+  Attachments.Count: "attachment_count"
+  
+# Common Transformations
+transformations:
+  # Convert action names to standard format
+  action_mapping:
+    "New-InboxRule": "New-InboxRule"
+    "Set-InboxRule": "Set-InboxRule"
+    "Remove-InboxRule": "Remove-InboxRule"
+    "New-TransportRule": "New-TransportRule"
+    "MailboxLogin": "MailboxLogin"
+    "UserLoggedIn": "MailboxLogin"
+    "Send": "Send"
+    "SendAs": "SendAs"
+    "SendOnBehalf": "SendOnBehalf"
+    "HardDelete": "HardDelete"
+    "SoftDelete": "SoftDelete"
+    "MoveToDeletedItems": "MoveToDeletedItems"
+    "MailItemsAccessed": "MailItemsAccessed"
+    
+  # Email domain type classification
+  domain_type_classification:
+    internal_domains:
+      - "company.com"
+      - "organization.local"
+      - "internal.domain"
+    external_indicators:
+      - "gmail.com"
+      - "yahoo.com"
+      - "outlook.com"
+      - "hotmail.com"
+      
+  # Authentication protocol normalization
+  auth_protocol_mapping:
+    "Basic": "BasicAuth"
+    "OAuth2.0": "OAuth"
+    "Modern": "ModernAuth"
+    "POP": "POP3"
+    "IMAP": "IMAP4"
+    "SMTP": "SMTP AUTH"
+
+# Log Source Categories
+log_source_categories:
+  outlook:
+    description: "Microsoft Outlook client logs"
+    typical_fields:
+      - message_id
+      - subject
+      - sender
+      - recipient
+      - date_sent
+      - date_received
+      
+  office365:
+    description: "Microsoft 365 cloud service logs"
+    typical_fields:
+      - user_id
+      - action
+      - client_ip
+      - timestamp
+      - result_status
+      
+  exchange:
+    description: "Microsoft Exchange Server logs"
+    typical_fields:
+      - sender
+      - recipient
+      - message_id
+      - client_ip
+      - server_hostname
+      
+  azure_ad:
+    description: "Azure Active Directory authentication logs"
+    typical_fields:
+      - user_principal_name
+      - client_ip
+      - auth_result
+      - geo_country
+      - risk_level

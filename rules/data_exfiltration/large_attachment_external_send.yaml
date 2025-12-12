@@ -1,0 +1,41 @@
+title: Large Attachment Sent to External Address
+id: 7a8b9c0d-1e2f-4a3b-4c5d-6e7f8a9b0c1d
+status: stable
+description: |
+  Detects emails with unusually large attachments being sent to external
+  email addresses. This could indicate data exfiltration, especially when
+  the recipient is unknown or the attachment contains compressed archives
+  that might hold sensitive information.
+author: Ryoshi Security Team
+date: 2025-01-10
+references:
+  - https://attack.mitre.org/techniques/T1048/003/
+  - https://attack.mitre.org/techniques/T1041/
+tags:
+  - data_exfiltration
+  - exfiltration_over_email
+severity: medium
+logsource:
+  category: outlook
+  product: office365
+detection:
+  selection_send:
+    action: "Send"
+    attachment_size: ">= 10485760"  # 10MB in bytes
+  selection_external:
+    recipient_domain_type: "External"
+  selection_archive:
+    attachment_extension:
+      - ".zip"
+      - ".rar"
+      - ".7z"
+      - ".tar"
+      - ".gz"
+  condition: selection_send and selection_external and (attachment_size or selection_archive)
+falsepositives:
+  - Legitimate business file transfers
+  - Collaboration with external partners
+  - Marketing materials or presentations
+  - Customer support sending documentation
+  - File sharing services not being used properly
+level: medium

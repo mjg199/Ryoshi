@@ -1,0 +1,217 @@
+# Ryoshi Rule Categories Configuration
+# Defines the categories and tags used for organizing detection rules
+
+categories:
+  credential_theft:
+    name: "Credential & Token Theft"
+    description: "Detection of credential theft, token theft, and unauthorized authentication attempts"
+    severity: high
+    tags:
+      - oauth
+      - password_reset
+      - token_theft
+      - credential_access
+      - authentication
+
+  email_manipulation:
+    name: "Email Manipulation"
+    description: "Detection of email content, metadata, or configuration tampering"
+    severity: high
+    tags:
+      - header_spoofing
+      - deletion
+      - modification
+      - impersonation
+      - covering_tracks
+
+  forwarding_rules:
+    name: "Email Forwarding Rules"
+    description: "Detection of suspicious email forwarding and redirection rules"
+    severity: high
+    tags:
+      - inbox_rules
+      - transport_rules
+      - auto_forward
+      - redirection
+      - persistence
+
+  data_exfiltration:
+    name: "Data Exfiltration"
+    description: "Detection of data being extracted from email systems"
+    severity: critical
+    tags:
+      - exfiltration
+      - bulk_download
+      - sensitive_data
+      - large_attachments
+      - collection
+
+  suspicious_access:
+    name: "Suspicious Access Patterns"
+    description: "Detection of unusual or unauthorized access to email accounts"
+    severity: medium
+    tags:
+      - impossible_travel
+      - legacy_auth
+      - failed_login
+      - anomalous_access
+      - brute_force
+
+  phishing:
+    name: "Phishing Attempts"
+    description: "Detection of phishing emails and related social engineering attacks"
+    severity: high
+    tags:
+      - spear_phishing
+      - credential_phishing
+      - malicious_links
+      - spoofing
+      - social_engineering
+
+  persistence:
+    name: "Persistence Mechanisms"
+    description: "Detection of techniques used to maintain access to email systems"
+    severity: high
+    tags:
+      - backdoor_rules
+      - delegate_access
+      - application_permissions
+      - mailbox_delegation
+
+  defense_evasion:
+    name: "Defense Evasion"
+    description: "Detection of attempts to hide malicious activities"
+    severity: medium
+    tags:
+      - log_deletion
+      - evidence_removal
+      - hidden_rules
+      - obfuscation
+
+# Severity level definitions
+severity_levels:
+  critical:
+    description: "Immediate threat requiring urgent response"
+    priority: 1
+    alert_type: "immediate"
+    examples:
+      - "Active credential theft"
+      - "Organization-wide forwarding rules"
+      - "Confirmed account takeover"
+
+  high:
+    description: "Significant security risk requiring prompt investigation"
+    priority: 2
+    alert_type: "urgent"
+    examples:
+      - "External forwarding rules"
+      - "Suspicious OAuth grants"
+      - "Bulk email deletion"
+
+  medium:
+    description: "Notable security concern requiring investigation"
+    priority: 3
+    alert_type: "standard"
+    examples:
+      - "Legacy protocol usage"
+      - "Large external attachments"
+      - "Unusual access patterns"
+
+  low:
+    description: "Minor security indicator for monitoring"
+    priority: 4
+    alert_type: "informational"
+    examples:
+      - "Non-standard client access"
+      - "Configuration changes"
+      - "Policy violations"
+
+  informational:
+    description: "Awareness-level detection for context"
+    priority: 5
+    alert_type: "log"
+    examples:
+      - "User behavior baselines"
+      - "Email volume statistics"
+      - "Configuration audits"
+
+# MITRE ATT&CK mapping for email-related techniques
+mitre_attack_mapping:
+  T1078:
+    name: "Valid Accounts"
+    description: "Adversaries may obtain and abuse credentials of existing accounts"
+    related_categories:
+      - credential_theft
+      - suspicious_access
+
+  T1114:
+    name: "Email Collection"
+    tactic: "Collection"
+    subtechniques:
+      T1114.002:
+        name: "Remote Email Collection"
+        related_categories:
+          - data_exfiltration
+      T1114.003:
+        name: "Email Forwarding Rule"
+        related_categories:
+          - forwarding_rules
+          - persistence
+
+  T1566:
+    name: "Phishing"
+    tactic: "Initial Access"
+    subtechniques:
+      T1566.001:
+        name: "Spearphishing Attachment"
+        related_categories:
+          - phishing
+      T1566.002:
+        name: "Spearphishing Link"
+        related_categories:
+          - phishing
+
+  T1048:
+    name: "Exfiltration Over Alternative Protocol"
+    tactic: "Exfiltration"
+    subtechniques:
+      T1048.003:
+        name: "Exfiltration Over Unencrypted/Obfuscated Non-C2 Protocol"
+        related_categories:
+          - data_exfiltration
+
+  T1070:
+    name: "Indicator Removal"
+    tactic: "Defense Evasion"
+    subtechniques:
+      T1070.004:
+        name: "File Deletion"
+        related_categories:
+          - email_manipulation
+          - defense_evasion
+
+  T1110:
+    name: "Brute Force"
+    tactic: "Credential Access"
+    subtechniques:
+      T1110.003:
+        name: "Password Spraying"
+        related_categories:
+          - suspicious_access
+      T1110.004:
+        name: "Credential Stuffing"
+        related_categories:
+          - suspicious_access
+
+  T1528:
+    name: "Steal Application Access Token"
+    tactic: "Credential Access"
+    related_categories:
+      - credential_theft
+
+  T1098:
+    name: "Account Manipulation"
+    tactic: "Persistence"
+    related_categories:
+      - credential_theft
+      - persistence
