@@ -1,0 +1,40 @@
+title: Bulk Email Deletion from Mailbox
+id: 5e6f7a8b-9c0d-4e1f-2a3b-4c5d6e7f8a9b
+status: stable
+description: |
+  Detects bulk deletion of emails from a mailbox in a short timeframe.
+  This behavior is often associated with attackers attempting to cover
+  their tracks by removing evidence of unauthorized access, phishing
+  emails sent from the compromised account, or forwarding rules.
+author: Ryoshi Security Team
+date: 2025-01-10
+modified: 2025-01-15
+references:
+  - https://attack.mitre.org/techniques/T1070/004/
+  - https://attack.mitre.org/techniques/T1114/
+tags:
+  - email_manipulation
+  - defense_evasion
+  - covering_tracks
+severity: high
+logsource:
+  category: outlook
+  product: office365
+detection:
+  selection:
+    action: 
+      - "SoftDelete"
+      - "HardDelete"
+      - "MoveToDeletedItems"
+    item_type: "Message"
+  count:
+    deleted_items: ">= 50"
+  condition: selection
+  timeframe: 15m
+falsepositives:
+  - Users cleaning up their mailbox
+  - IT administrators performing mailbox maintenance
+  - Automated retention policies
+  - Email client synchronization issues causing mass deletions
+  - Users migrating to new email systems
+level: high

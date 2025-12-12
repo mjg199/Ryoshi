@@ -1,0 +1,36 @@
+title: Impossible Travel - Email Access from Multiple Locations
+id: 0d1e2f3a-4b5c-4d6e-7f8a-9b0c1d2e3f4a
+status: stable
+description: |
+  Detects email access from geographically distant locations within an
+  impossible timeframe. This indicates credential compromise where
+  multiple actors or automated tools are accessing the account from
+  different locations simultaneously.
+author: Ryoshi Security Team
+date: 2025-01-10
+references:
+  - https://attack.mitre.org/techniques/T1078/
+  - https://docs.microsoft.com/en-us/azure/active-directory/identity-protection/concept-identity-protection-risks
+tags:
+  - suspicious_access
+  - credential_theft
+  - account_compromise
+severity: critical
+logsource:
+  category: outlook
+  product: office365
+detection:
+  selection:
+    action: "MailboxLogin"
+    impossible_travel: "true"
+  selection_distance:
+    geo_distance_km: ">= 500"
+  selection_timeframe:
+    time_between_access_minutes: "<= 60"
+  condition: selection or (selection_distance and selection_timeframe)
+falsepositives:
+  - VPN connections appearing from different locations
+  - Users traveling by air between locations
+  - Shared accounts accessed by different team members
+  - Cloud proxy services with distributed endpoints
+level: critical

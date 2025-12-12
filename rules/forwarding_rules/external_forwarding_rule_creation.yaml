@@ -1,0 +1,42 @@
+title: Email Forwarding to External Domain
+id: 1a2b3c4d-5e6f-4a7b-8c9d-0e1f2a3b4c5d
+status: stable
+description: |
+  Detects the creation of inbox rules that forward emails to external domains.
+  This is a common data exfiltration technique used by attackers after compromising
+  an account. Attackers create forwarding rules to receive copies of sensitive
+  emails without the user's knowledge.
+author: Ryoshi Security Team
+date: 2025-01-10
+modified: 2025-01-15
+references:
+  - https://attack.mitre.org/techniques/T1114/003/
+  - https://docs.microsoft.com/en-us/microsoft-365/security/office-365-security/detect-and-remediate-outlook-rules-forms-attack
+tags:
+  - forwarding_rules
+  - data_exfiltration
+  - persistence
+severity: high
+logsource:
+  category: outlook
+  product: office365
+detection:
+  selection:
+    action: "New-InboxRule"
+    mailbox_rule_action:
+      - "ForwardTo"
+      - "ForwardAsAttachmentTo"
+      - "RedirectTo"
+  filter_internal:
+    forwarding_address|endswith:
+      - "@company.com"
+      - "@organization.local"
+      - "@internal.domain"
+  condition: selection and not filter_internal
+  timeframe: 15m
+falsepositives:
+  - Legitimate business process automation to partner organizations
+  - Personal email forwarding to work accounts (if policy allows)
+  - Vacation auto-forwarding to alternate work email
+  - IT support temporary forwarding for troubleshooting
+level: high

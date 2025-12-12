@@ -1,0 +1,40 @@
+title: Authentication via Legacy Email Protocols
+id: 1e2f3a4b-5c6d-4e7f-8a9b-0c1d2e3f4a5b
+status: stable
+description: |
+  Detects authentication attempts using legacy protocols like POP3, IMAP,
+  or basic authentication. These protocols lack modern security features
+  and are often targeted by attackers for credential stuffing or used
+  after initial compromise to maintain access.
+author: Ryoshi Security Team
+date: 2025-01-10
+references:
+  - https://attack.mitre.org/techniques/T1078/
+  - https://docs.microsoft.com/en-us/exchange/clients-and-mobile-in-exchange-online/deprecation-of-basic-authentication-exchange-online
+tags:
+  - suspicious_access
+  - credential_access
+  - legacy_auth
+severity: medium
+logsource:
+  category: outlook
+  product: office365
+detection:
+  selection_protocol:
+    auth_protocol:
+      - "POP3"
+      - "IMAP4"
+      - "BasicAuth"
+      - "SMTP AUTH"
+  selection_action:
+    action: "MailboxLogin"
+  filter_allowed:
+    user_allowed_legacy_auth: "true"
+  condition: (selection_protocol or selection_action) and not filter_allowed
+falsepositives:
+  - Legacy email clients that cannot support modern authentication
+  - IoT devices or embedded systems sending email
+  - Third-party applications not yet upgraded
+  - Scanning/multifunction printers
+  - Legitimate business applications requiring basic auth
+level: medium
