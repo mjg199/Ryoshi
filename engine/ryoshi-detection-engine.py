@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 """
 Ryoshi M365 eDiscovery Detection Engine
-Detects credential theft and token compromise in M365 audit logs
+Dynamically loads and processes detection rules from YAML files
 
 Usage:
   python3 ryoshi-detection-engine.py -f /path/to/file.csv
   python3 ryoshi-detection-engine.py -F /path/to/folder/
-  python3 ryoshi-detection-engine.py -f file1.csv -f file2.csv -F /folder/
+  python3 ryoshi-detection-engine.py --rules-dir ./rules -f audit.csv
 """
 
 import csv
@@ -18,15 +18,76 @@ from datetime import datetime, timedelta
 from collections import defaultdict
 import re
 
+try:
+    import yaml
+except ImportError:
+    print("[!] PyYAML not installed. Run: pip install pyyaml")
+    yaml = None
+
+
+def get_default_rules_dir():
+    """Find rules directory relative to script location"""
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    
+    # Check common locations relative to script
+    possible_paths = [
+        os.path.join(script_dir, '..', 'rules'),      # engine/script.py -> rules/
+        os.path.join(script_dir, 'rules'),            # script.py in root -> rules/
+        os.path.join(os.getcwd(), 'rules'),           # current working directory
+    ]
+    
+    for path in possible_paths:
+        if os.path.isdir(path):
+            return os.path.abspath(path)
+    
+    return None
+
 
 class RyoshiDetectionEngine:
-    def __init__(self):
+    def __init__(self, rules_dir=None):
         self.logs = []
+        self.rules = {}
         self.compromises = {
             'credential_theft': [],
             'token_compromise': []
         }
+        self.rule_detections = {}  # Detections from dynamic rules
         self.timelines = {}
+        
+        # Auto-discover rules directory
+        if rules_dir is None:
+            rules_dir = get_default_rules_dir()
+        
+        if rules_dir:
+            self.load_rules(rules_dir)
+    
+    def load_rules(self, rules_dir):
+        """Load all YAML rules from directory"""
+        if yaml is None:
+            print("[!] PyYAML not installed. Skipping rule loading.")
+            return
+        
+        print(f"[*] Loading rules from {rules_dir}...")
+        
+        if not os.path.isdir(rules_dir):
+            print(f"[!] Rules directory not found: {rules_dir}")
+            return
+        
+        # Find all YAML files recursively
+        yaml_files = glob.glob(os.path.join(rules_dir, '**/*.yaml'), recursive=True)
+        
+        for rule_file in sorted(yaml_files):
+            try:
+                with open(rule_file, 'r') as f:
+                    rule = yaml.safe_load(f)
+                    if rule and 'id' in rule:
+                        rule['_file'] = rule_file
+                        self.rules[rule['id']] = rule
+                        print(f"    [+] {rule.get('title', rule['id'])}")
+            except Exception as e:
+                print(f"    [!] Error loading {rule_file}: {e}")
+        
+        print(f"[+] Total rules loaded: {len(self.rules)}\n")
 
     def load_csv(self, filepath):
         """Load and parse a CSV file with M365 audit logs"""
@@ -356,6 +417,123 @@ class RyoshiDetectionEngine:
             for sid in high_downloads[:3]:
                 print(f"    Session {sid[:36]}... : {session_downloads[sid]} downloads")
 
+    def run_all_rules(self):
+        """Execute all loaded YAML rules against the logs"""
+        if not self.rules:
+            print("[*] No YAML rules loaded. Skipping dynamic rule execution.")
+            return
+        
+        print(f"\n[*] Executing {len(self.rules)} YAML rules...")
+        print("-" * 50)
+        
+        for rule_id, rule in self.rules.items():
+            self._execute_rule(rule_id, rule)
+    
+    def _execute_rule(self, rule_id, rule):
+        """Execute a single rule against the logs"""
+        rule_title = rule.get('title', rule_id)
+        severity = rule.get('severity', 'MEDIUM').upper()
+        
+        # Initialize detection results for this rule
+        if rule_id not in self.rule_detections:
+            self.rule_detections[rule_id] = {
+                'title': rule_title,
+                'severity': severity,
+                'matches': [],
+                'count': 0
+            }
+        
+        # Get detection criteria from rule
+        detection = rule.get('detection', {})
+        selection = detection.get('selection', {})
+        
+        # Extract operations to match
+        ops_to_match = self._get_operations_from_selection(selection)
+        
+        # Get threshold and timeframe if specified
+        condition = detection.get('condition', '')
+        threshold = self._extract_threshold(condition)
+        
+        # Search logs for matching operations
+        matches = []
+        for log_entry in self.logs:
+            if self._matches_selection(log_entry, selection, ops_to_match):
+                matches.append({
+                    'timestamp': log_entry['timestamp'],
+                    'user': log_entry['user_id'],
+                    'operation': log_entry['operation'],
+                    'ips': list(self.extract_ip_addresses(log_entry))
+                })
+        
+        # Apply threshold logic if specified
+        if threshold and len(matches) < threshold:
+            return  # Didn't meet threshold
+        
+        # Store results
+        self.rule_detections[rule_id]['matches'] = matches[:10]  # Keep first 10 samples
+        self.rule_detections[rule_id]['count'] = len(matches)
+        
+        # Print findings
+        if matches:
+            print(f"\n[!] {rule_title}")
+            print(f"    Severity: {severity} | Matches: {len(matches)}")
+            if matches[:2]:
+                for m in matches[:2]:
+                    print(f"    - {m['user']} @ {m['timestamp']}")
+    
+    def _get_operations_from_selection(self, selection):
+        """Extract operation names from selection criteria"""
+        ops = []
+        
+        if isinstance(selection, dict):
+            op_value = selection.get('operation') or selection.get('Operations')
+            if isinstance(op_value, list):
+                ops = op_value
+            elif isinstance(op_value, str):
+                ops = [op_value]
+        elif isinstance(selection, list):
+            for item in selection:
+                if isinstance(item, dict):
+                    op = item.get('operation') or item.get('Operations')
+                    if op:
+                        ops.append(op) if isinstance(op, str) else ops.extend(op)
+        
+        return ops
+    
+    def _matches_selection(self, log_entry, selection, ops_to_match):
+        """Check if a log entry matches the selection criteria"""
+        # Match by operation
+        if ops_to_match:
+            if log_entry['operation'] not in ops_to_match:
+                # Check for partial/prefix matches
+                matched = False
+                for op in ops_to_match:
+                    if op.endswith('*') and log_entry['operation'].startswith(op[:-1]):
+                        matched = True
+                        break
+                if not matched:
+                    return False
+        
+        # Additional field matching from selection
+        if isinstance(selection, dict):
+            audit = log_entry.get('audit_data', {})
+            for key, expected in selection.items():
+                if key in ['operation', 'Operations']:
+                    continue  # Already handled
+                actual = audit.get(key) or log_entry.get('raw', {}).get(key)
+                if expected and actual != expected:
+                    return False
+        
+        return True
+    
+    def _extract_threshold(self, condition):
+        """Extract numeric threshold from condition string"""
+        import re
+        match = re.search(r'count[^0-9]*([0-9]+)', str(condition), re.IGNORECASE)
+        if match:
+            return int(match.group(1))
+        return None
+
     def build_timeline(self, user):
         """Build activity timeline for a compromised user"""
         print(f"\n[*] Building activity timeline for {user}...")
@@ -384,14 +562,28 @@ class RyoshiDetectionEngine:
         """Generate detection and timeline reports"""
         print(f"\n[*] Generating reports to {output_dir}...")
         
+        # Count rule detections by severity
+        rule_findings = {}
+        for rule_id, data in self.rule_detections.items():
+            if data['count'] > 0:
+                rule_findings[rule_id] = {
+                    'title': data['title'],
+                    'severity': data['severity'],
+                    'count': data['count'],
+                    'samples': data['matches']
+                }
+        
         report = {
             'generated_at': datetime.now().isoformat(),
             'total_events_analyzed': len(self.logs),
+            'rules_loaded': len(self.rules),
             'detections': {
                 'credential_theft': len(self.compromises['credential_theft']),
-                'token_compromise': len(self.compromises['token_compromise'])
+                'token_compromise': len(self.compromises['token_compromise']),
+                'rule_based_findings': len(rule_findings)
             },
-            'findings': self.compromises
+            'builtin_findings': self.compromises,
+            'rule_findings': rule_findings
         }
         
         report_path = os.path.join(output_dir, 'ryoshi_detection_report.json')
@@ -416,21 +608,34 @@ class RyoshiDetectionEngine:
         print("RYOSHI DETECTION SUMMARY")
         print("="*60)
         print(f"Total events analyzed: {len(self.logs)}")
-        print(f"Credential theft incidents: {len(self.compromises['credential_theft'])}")
-        print(f"Token compromise incidents: {len(self.compromises['token_compromise'])}")
+        print(f"Rules loaded: {len(self.rules)}")
+        print(f"\nBuilt-in Detections:")
+        print(f"  Credential theft incidents: {len(self.compromises['credential_theft'])}")
+        print(f"  Token compromise incidents: {len(self.compromises['token_compromise'])}")
+        
+        # Summarize rule-based detections by severity
+        critical = sum(1 for d in self.rule_detections.values() if d['severity'] == 'CRITICAL' and d['count'] > 0)
+        high = sum(1 for d in self.rule_detections.values() if d['severity'] == 'HIGH' and d['count'] > 0)
+        medium = sum(1 for d in self.rule_detections.values() if d['severity'] == 'MEDIUM' and d['count'] > 0)
+        
+        if self.rules:
+            print(f"\nYAML Rule Detections (by severity):")
+            print(f"  CRITICAL: {critical}")
+            print(f"  HIGH: {high}")
+            print(f"  MEDIUM: {medium}")
         print("="*60)
 
 
 def main():
     parser = argparse.ArgumentParser(
-        description='Ryoshi M365 eDiscovery Detection Engine',
+        description='Ryoshi M365 eDiscovery Detection Engine (Rule-Based)',
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
   %(prog)s -f /path/to/audit_log.csv
   %(prog)s -F /path/to/logs_folder/
-  %(prog)s -f file1.csv -f file2.csv
-  %(prog)s -F /folder1 -F /folder2 -f extra_file.csv
+  %(prog)s --rules-dir ./rules -f audit.csv
+  %(prog)s -f file1.csv -f file2.csv --no-builtin
         """
     )
     
@@ -451,6 +656,18 @@ Examples:
     )
     
     parser.add_argument(
+        '--rules-dir',
+        default=None,
+        help='Path to rules directory (auto-detected by default)'
+    )
+    
+    parser.add_argument(
+        '--no-builtin',
+        action='store_true',
+        help='Disable built-in detections (credential theft, token compromise)'
+    )
+    
+    parser.add_argument(
         '-o', '--output',
         default='/tmp',
         help='Output directory for reports (default: /tmp)'
@@ -461,10 +678,11 @@ Examples:
     if not args.files and not args.folders:
         parser.error("You must specify at least one file (-f) or folder (-F)")
     
-    print("[+] Ryoshi M365 eDiscovery Detection Engine")
-    print("="*50)
+    print("[+] Ryoshi M365 eDiscovery Detection Engine (Rule-Based)")
+    print("="*60)
     
-    engine = RyoshiDetectionEngine()
+    # Initialize engine with rules directory
+    engine = RyoshiDetectionEngine(rules_dir=args.rules_dir)
     
     if args.files:
         for filepath in args.files:
@@ -486,15 +704,15 @@ Examples:
     
     print(f"\n[+] Total events loaded: {len(engine.logs)}")
     
-    engine.detect_credential_theft()
-    engine.detect_token_compromise()
-    engine.detect_bulk_email_access(threshold=500)
-    engine.detect_sendas_operations()
-    engine.detect_email_deletions()
-    engine.detect_inbox_rules()
-    engine.detect_failed_logins()
-    engine.detect_file_downloads(threshold=50)
+    # Run built-in detections (unless disabled)
+    if not args.no_builtin:
+        engine.detect_credential_theft()
+        engine.detect_token_compromise()
     
+    # Run all YAML-based rules dynamically
+    engine.run_all_rules()
+    
+    # Build timelines for compromised users
     compromised_users = set()
     for finding in engine.compromises['credential_theft']:
         compromised_users.add(finding['user'])

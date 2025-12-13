@@ -4,9 +4,7 @@ status: experimental
 description: |
   Detects token compromise where a single session/token is used from multiple
   distinct IP addresses. This indicates an attacker has stolen a user's session
-  token and is actively replaying it across their infrastructure. The presence
-  of KMSI (Keep Me Signed In) indicates the attacker may be leveraging
-  persistent authentication.
+  token and is actively replaying it across their infrastructure.
 severity: CRITICAL
 logsource:
   category: authentication
@@ -14,59 +12,19 @@ logsource:
   service: AzureActiveDirectory
 detection:
   selection:
-    - session_id: "*"
+    session_id: "*"
   filter:
-    - unique_ips: ">=2"
-      OR
-      kmsi_enabled: "true"
-      duration_hours: ">=1"
-  condition: selection and filter
+    unique_ips: ">=2"
+  condition: selection and filter | count by session_id > 1 and unique_ips >= 2
 output_fields:
   - timestamp: CreationDate
   - session_id: SessionId
-  - aad_session_id: AppAccessContext.AADSessionId
   - client_ip: ClientIP
   - operation: Operations
-  - workload: Workload
-  - result_status: ResultStatus
-  - kmsi: ExtendedProperties
-report:
-  title: "Token Compromise Detection: Session Hijacking"
-  severity: CRITICAL
-  template: |
-    Session ID: {session_id}
-    Users: {users}
-    Detection Time: {timestamp}
-    Unique IPs: {unique_ips}
-    KMSI Enabled: {kmsi_enabled}
-    Duration: {duration_hours}h
-    First Activity: {first_seen}
-    Last Activity: {last_seen}
-    Operations Count: {operation_count}
-    
-    IP Addresses Used:
-    {ip_addresses}
-    
-    Attack Pattern:
-    - Session token stolen or intercepted
-    - Token replayed from multiple attacker infrastructure IPs
-    - Possible long-term token persistence enabled
-    
-    Recommendation:
-    - Revoke all session tokens immediately
-    - Force password reset
-    - Audit all operations performed during compromise window
-    - Review email access, forwarding rules, sent items
-    - Check for malware/RAT installation
-    - Monitor for lateral movement attempts
 falsepositives:
   - Legitimate use of OAuth refresh tokens across regions
   - CDN or load balancer network behavior
-  - Internal corporate proxy/firewall IP changes
 mitigation:
   - Revoke all OAuth tokens
   - Force password reset
   - Enable conditional access policies
-  - Block suspicious IPs
-  - Review email inbox rules and forwarding
-  - Check for unauthorized apps/permissions
