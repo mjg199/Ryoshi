@@ -107,8 +107,8 @@ class RyoshiDetectionEngine:
                         
                         log_entry = {
                             'timestamp': row.get('CreationDate', ''),
-                            'user_id': row.get('UserIds', ''),
-                            'operation': row.get('Operations', ''),
+                            'user_id': row.get('UserId', '') or row.get('UserIds', ''),
+                            'operation': row.get('Operation', '') or row.get('Operations', ''),
                             'audit_data': audit_data,
                             'raw': row
                         }
@@ -559,8 +559,11 @@ class RyoshiDetectionEngine:
         return events
 
     def generate_report(self, output_dir='/tmp'):
-        """Generate detection and timeline reports"""
+        """Generate detection and timeline reports (JSON, HTML, Markdown)"""
         print(f"\n[*] Generating reports to {output_dir}...")
+        
+        # Ensure output directory exists
+        os.makedirs(output_dir, exist_ok=True)
         
         # Count rule detections by severity
         rule_findings = {}
@@ -573,9 +576,17 @@ class RyoshiDetectionEngine:
                     'samples': data['matches']
                 }
         
+        # Calculate totals
+        total_unique_ips = set()
+        for finding in self.compromises['credential_theft']:
+            total_unique_ips.update(finding.get('ip_addresses', []))
+        for finding in self.compromises['token_compromise']:
+            total_unique_ips.update(finding.get('ip_addresses', []))
+        
         report = {
             'generated_at': datetime.now().isoformat(),
             'total_events_analyzed': len(self.logs),
+            'unique_ips_found': len(total_unique_ips),
             'rules_loaded': len(self.rules),
             'detections': {
                 'credential_theft': len(self.compromises['credential_theft']),
@@ -586,21 +597,699 @@ class RyoshiDetectionEngine:
             'rule_findings': rule_findings
         }
         
+        # Save JSON report
         report_path = os.path.join(output_dir, 'ryoshi_detection_report.json')
-        with open(report_path, 'w') as f:
+        with open(report_path, 'w', encoding='utf-8') as f:
             json.dump(report, f, indent=2, default=str)
         print(f"[+] Detection report saved: {report_path}")
         
+        # Generate HTML report
+        self._generate_html_report(output_dir, report, rule_findings)
+        
+        # Generate Markdown report
+        self._generate_markdown_report(output_dir, report, rule_findings)
+        
+        # Save timelines
         for user, timeline in self.timelines.items():
             safe_user = user.replace('@', '_').replace('.', '_')
             timeline_path = os.path.join(output_dir, f'ryoshi_timeline_{safe_user}.json')
-            with open(timeline_path, 'w') as f:
+            with open(timeline_path, 'w', encoding='utf-8') as f:
                 json.dump({
                     'user': user,
                     'event_count': len(timeline),
                     'timeline': timeline
                 }, f, indent=2, default=str)
             print(f"[+] Timeline saved: {timeline_path}")
+
+    def _generate_html_report(self, output_dir, report, rule_findings):
+        """Generate professional HTML detection report"""
+        
+        # Count severities
+        critical_count = sum(1 for d in self.rule_detections.values() if d['severity'] == 'CRITICAL' and d['count'] > 0)
+        high_count = sum(1 for d in self.rule_detections.values() if d['severity'] == 'HIGH' and d['count'] > 0)
+        medium_count = sum(1 for d in self.rule_detections.values() if d['severity'] == 'MEDIUM' and d['count'] > 0)
+        
+        html_content = f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Ryoshi Security Detection Report</title>
+    <style>
+        :root {{
+            --primary-dark: #0d1b2a;
+            --primary-blue: #1b4965;
+            --accent-blue: #3d5a80;
+            --light-blue: #5fa8d3;
+            --critical-red: #c1121f;
+            --warning-orange: #e07b39;
+            --success-green: #2a9d8f;
+            --background: #f8f9fa;
+            --card-bg: #ffffff;
+            --text-primary: #1d1d1d;
+            --text-secondary: #5c5c5c;
+            --border-light: #e0e0e0;
+        }}
+        
+        * {{
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }}
+        
+        body {{
+            font-family: 'Segoe UI', -apple-system, BlinkMacSystemFont, Arial, sans-serif;
+            background: var(--background);
+            color: var(--text-primary);
+            line-height: 1.6;
+            min-height: 100vh;
+        }}
+        
+        .report-header {{
+            background: linear-gradient(135deg, var(--primary-dark) 0%, var(--primary-blue) 100%);
+            color: white;
+            padding: 40px 0;
+            margin-bottom: 40px;
+        }}
+        
+        .header-content {{
+            max-width: 1200px;
+            margin: 0 auto;
+            padding: 0 40px;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }}
+        
+        .logo-section {{
+            display: flex;
+            align-items: center;
+            gap: 16px;
+        }}
+        
+        .logo-icon {{
+            width: 56px;
+            height: 56px;
+            background: rgba(255,255,255,0.15);
+            border-radius: 12px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 28px;
+        }}
+        
+        .report-title {{
+            font-size: 28px;
+            font-weight: 600;
+            letter-spacing: -0.5px;
+        }}
+        
+        .report-subtitle {{
+            font-size: 14px;
+            opacity: 0.85;
+            margin-top: 4px;
+        }}
+        
+        .report-meta {{
+            text-align: right;
+        }}
+        
+        .report-date {{
+            font-size: 14px;
+            opacity: 0.9;
+        }}
+        
+        .report-id {{
+            font-size: 12px;
+            opacity: 0.7;
+            margin-top: 4px;
+            font-family: 'Consolas', monospace;
+        }}
+        
+        .container {{
+            max-width: 1200px;
+            margin: 0 auto;
+            padding: 0 40px 60px;
+        }}
+        
+        .section {{
+            background: var(--card-bg);
+            border-radius: 12px;
+            box-shadow: 0 1px 3px rgba(0,0,0,0.08), 0 4px 12px rgba(0,0,0,0.05);
+            padding: 32px;
+            margin-bottom: 28px;
+        }}
+        
+        .section-header {{
+            display: flex;
+            align-items: center;
+            gap: 12px;
+            margin-bottom: 24px;
+            padding-bottom: 16px;
+            border-bottom: 1px solid var(--border-light);
+        }}
+        
+        .section-icon {{
+            width: 40px;
+            height: 40px;
+            border-radius: 10px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 20px;
+        }}
+        
+        .section-icon.blue {{ background: rgba(59, 130, 246, 0.1); }}
+        .section-icon.red {{ background: rgba(193, 18, 31, 0.1); }}
+        .section-icon.orange {{ background: rgba(224, 123, 57, 0.1); }}
+        .section-icon.green {{ background: rgba(42, 157, 143, 0.1); }}
+        
+        .section-title {{
+            font-size: 20px;
+            font-weight: 600;
+            color: var(--primary-dark);
+            flex: 1;
+        }}
+        
+        .summary-grid {{
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+            gap: 20px;
+        }}
+        
+        .metric-card {{
+            background: linear-gradient(135deg, #f8f9fa 0%, #ffffff 100%);
+            border: 1px solid var(--border-light);
+            border-radius: 10px;
+            padding: 24px 20px;
+            text-align: center;
+            transition: transform 0.2s ease, box-shadow 0.2s ease;
+        }}
+        
+        .metric-card:hover {{
+            transform: translateY(-2px);
+            box-shadow: 0 4px 12px rgba(0,0,0,0.1);
+        }}
+        
+        .metric-value {{
+            font-size: 32px;
+            font-weight: 700;
+            color: var(--primary-blue);
+            line-height: 1.2;
+        }}
+        
+        .metric-value.critical {{ color: var(--critical-red); }}
+        .metric-value.warning {{ color: var(--warning-orange); }}
+        .metric-value.success {{ color: var(--success-green); }}
+        
+        .metric-label {{
+            font-size: 13px;
+            color: var(--text-secondary);
+            margin-top: 8px;
+            font-weight: 500;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+        }}
+        
+        .risk-badge {{
+            display: inline-flex;
+            align-items: center;
+            padding: 4px 12px;
+            border-radius: 20px;
+            font-size: 12px;
+            font-weight: 600;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+        }}
+        
+        .risk-badge.critical {{
+            background: rgba(193, 18, 31, 0.1);
+            color: var(--critical-red);
+        }}
+        
+        .risk-badge.high {{
+            background: rgba(224, 123, 57, 0.1);
+            color: var(--warning-orange);
+        }}
+        
+        .risk-badge.medium {{
+            background: rgba(251, 191, 36, 0.1);
+            color: #b45309;
+        }}
+        
+        .risk-badge.low {{
+            background: rgba(42, 157, 143, 0.1);
+            color: var(--success-green);
+        }}
+        
+        .finding-card {{
+            background: #ffffff;
+            border: 1px solid var(--border-light);
+            border-radius: 10px;
+            margin-bottom: 16px;
+            overflow: hidden;
+            transition: box-shadow 0.2s ease;
+        }}
+        
+        .finding-card:hover {{
+            box-shadow: 0 4px 12px rgba(0,0,0,0.08);
+        }}
+        
+        .finding-card.critical {{
+            border-left: 4px solid var(--critical-red);
+        }}
+        
+        .finding-card.warning {{
+            border-left: 4px solid var(--warning-orange);
+        }}
+        
+        .finding-header {{
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            padding: 16px 20px;
+            background: #fafafa;
+            border-bottom: 1px solid var(--border-light);
+        }}
+        
+        .finding-title {{
+            font-size: 16px;
+            font-weight: 600;
+            color: var(--primary-dark);
+        }}
+        
+        .finding-body {{
+            padding: 0;
+        }}
+        
+        .data-table {{
+            width: 100%;
+            border-collapse: collapse;
+        }}
+        
+        .data-table th {{
+            background: var(--primary-blue);
+            color: white;
+            padding: 14px 16px;
+            text-align: left;
+            font-weight: 600;
+            font-size: 13px;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+            position: sticky;
+            top: 0;
+        }}
+        
+        .data-table td {{
+            padding: 14px 16px;
+            border-bottom: 1px solid var(--border-light);
+            font-size: 14px;
+            vertical-align: top;
+        }}
+        
+        .data-table tr:nth-child(even) {{
+            background: #f9fafb;
+        }}
+        
+        .data-table tr:hover {{
+            background: #f0f4f8;
+        }}
+        
+        .data-table td:first-child {{
+            font-weight: 600;
+            color: var(--text-secondary);
+            width: 180px;
+        }}
+        
+        .ip-list {{
+            display: flex;
+            flex-wrap: wrap;
+            gap: 6px;
+        }}
+        
+        .ip-tag {{
+            background: #e8f4f8;
+            padding: 4px 10px;
+            border-radius: 4px;
+            font-family: 'Consolas', monospace;
+            font-size: 12px;
+            color: var(--primary-blue);
+        }}
+        
+        .status-yes {{
+            color: var(--critical-red);
+            font-weight: 600;
+        }}
+        
+        .status-no {{
+            color: var(--success-green);
+            font-weight: 600;
+        }}
+        
+        .empty-state {{
+            text-align: center;
+            padding: 40px 20px;
+            color: var(--text-secondary);
+        }}
+        
+        .empty-icon {{
+            font-size: 48px;
+            margin-bottom: 16px;
+            opacity: 0.5;
+        }}
+        
+        .empty-text {{
+            font-size: 16px;
+            color: var(--success-green);
+            font-weight: 500;
+        }}
+        
+        .report-footer {{
+            text-align: center;
+            padding: 32px;
+            color: var(--text-secondary);
+            font-size: 13px;
+            border-top: 1px solid var(--border-light);
+            margin-top: 20px;
+        }}
+        
+        .footer-brand {{
+            font-weight: 600;
+            color: var(--primary-blue);
+        }}
+        
+        .rule-item {{
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            padding: 12px 16px;
+            border-bottom: 1px solid var(--border-light);
+        }}
+        
+        .rule-item:last-child {{
+            border-bottom: none;
+        }}
+        
+        .rule-info {{
+            flex: 1;
+        }}
+        
+        .rule-title {{
+            font-weight: 600;
+            color: var(--text-primary);
+        }}
+        
+        .rule-count {{
+            font-size: 13px;
+            color: var(--text-secondary);
+            margin-top: 2px;
+        }}
+    </style>
+</head>
+<body>
+    <header class="report-header">
+        <div class="header-content">
+            <div class="logo-section">
+                <div class="logo-icon">&#128737;</div>
+                <div>
+                    <div class="report-title">Ryoshi Security Report</div>
+                    <div class="report-subtitle">M365 eDiscovery Threat Detection Analysis</div>
+                </div>
+            </div>
+            <div class="report-meta">
+                <div class="report-date">Generated: {report['generated_at'][:19].replace('T', ' ')}</div>
+                <div class="report-id">Report ID: RYO-{report['generated_at'][:10].replace('-', '')}</div>
+            </div>
+        </div>
+    </header>
+    
+    <main class="container">
+        <section class="section">
+            <div class="section-header">
+                <div class="section-icon blue">&#128202;</div>
+                <h2 class="section-title">Executive Summary</h2>
+            </div>
+            <div class="summary-grid">
+                <div class="metric-card">
+                    <div class="metric-value">{report['total_events_analyzed']:,}</div>
+                    <div class="metric-label">Events Analyzed</div>
+                </div>
+                <div class="metric-card">
+                    <div class="metric-value">{report.get('unique_ips_found', 0)}</div>
+                    <div class="metric-label">Unique IPs</div>
+                </div>
+                <div class="metric-card">
+                    <div class="metric-value">{report['rules_loaded']}</div>
+                    <div class="metric-label">Rules Loaded</div>
+                </div>
+                <div class="metric-card">
+                    <div class="metric-value critical">{report['detections']['credential_theft']}</div>
+                    <div class="metric-label">Credential Theft</div>
+                </div>
+                <div class="metric-card">
+                    <div class="metric-value warning">{report['detections']['token_compromise']}</div>
+                    <div class="metric-label">Token Compromise</div>
+                </div>
+                <div class="metric-card">
+                    <div class="metric-value critical">{critical_count}</div>
+                    <div class="metric-label">Critical Rules</div>
+                </div>
+            </div>
+        </section>
+
+        <section class="section">
+            <div class="section-header">
+                <div class="section-icon red">&#128680;</div>
+                <h2 class="section-title">Credential Theft Detections</h2>
+                <span class="risk-badge critical">{report['detections']['credential_theft']} Found</span>
+            </div>
+"""
+        
+        if self.compromises['credential_theft']:
+            for finding in self.compromises['credential_theft']:
+                ip_tags = ''.join([f'<span class="ip-tag">{ip}</span>' for ip in finding['ip_addresses'][:10]])
+                if len(finding['ip_addresses']) > 10:
+                    ip_tags += f'<span class="ip-tag">+{len(finding["ip_addresses"]) - 10} more</span>'
+                html_content += f"""
+            <div class="finding-card critical">
+                <div class="finding-header">
+                    <span class="finding-title">{finding['user']}</span>
+                    <span class="risk-badge critical">Critical</span>
+                </div>
+                <div class="finding-body">
+                    <table class="data-table">
+                        <tr><td>Duration</td><td>{finding['duration_hours']:.2f} hours</td></tr>
+                        <tr><td>Unique Sessions</td><td><strong>{finding['unique_sessions']}</strong></td></tr>
+                        <tr><td>Unique IPs</td><td><strong>{finding['unique_ips']}</strong></td></tr>
+                        <tr><td>Login Count</td><td>{finding['login_count']}</td></tr>
+                        <tr><td>First Seen</td><td>{finding['first_seen'][:19].replace('T', ' ')}</td></tr>
+                        <tr><td>Last Seen</td><td>{finding['last_seen'][:19].replace('T', ' ')}</td></tr>
+                        <tr><td>IP Addresses</td><td><div class="ip-list">{ip_tags}</div></td></tr>
+                    </table>
+                </div>
+            </div>
+"""
+        else:
+            html_content += """
+            <div class="empty-state">
+                <div class="empty-icon">&#9989;</div>
+                <div class="empty-text">No credential theft detected</div>
+            </div>
+"""
+
+        html_content += f"""
+        </section>
+
+        <section class="section">
+            <div class="section-header">
+                <div class="section-icon orange">&#9888;</div>
+                <h2 class="section-title">Token Compromise Detections</h2>
+                <span class="risk-badge high">{report['detections']['token_compromise']} Found</span>
+            </div>
+"""
+        
+        if self.compromises['token_compromise']:
+            for finding in self.compromises['token_compromise']:
+                users = ', '.join(finding['users']) if finding['users'] else 'Unknown'
+                kmsi_status = '<span class="status-yes">Yes</span>' if finding['kmsi_enabled'] else '<span class="status-no">No</span>'
+                ip_tags = ''.join([f'<span class="ip-tag">{ip}</span>' for ip in finding['ip_addresses'][:8]])
+                if len(finding['ip_addresses']) > 8:
+                    ip_tags += f'<span class="ip-tag">+{len(finding["ip_addresses"]) - 8} more</span>'
+                html_content += f"""
+            <div class="finding-card warning">
+                <div class="finding-header">
+                    <span class="finding-title">Session: {finding['session_id'][:36]}...</span>
+                    <span class="risk-badge high">High Risk</span>
+                </div>
+                <div class="finding-body">
+                    <table class="data-table">
+                        <tr><td>Users</td><td><strong>{users}</strong></td></tr>
+                        <tr><td>Unique IPs</td><td><strong>{finding['unique_ips']}</strong></td></tr>
+                        <tr><td>Operations</td><td>{finding['operation_count']:,}</td></tr>
+                        <tr><td>KMSI Enabled</td><td>{kmsi_status}</td></tr>
+                        <tr><td>Duration</td><td>{finding['duration_hours']:.2f} hours</td></tr>
+                        <tr><td>First Seen</td><td>{finding['first_seen'][:19].replace('T', ' ')}</td></tr>
+                        <tr><td>Last Seen</td><td>{finding['last_seen'][:19].replace('T', ' ')}</td></tr>
+                        <tr><td>IP Addresses</td><td><div class="ip-list">{ip_tags}</div></td></tr>
+                    </table>
+                </div>
+            </div>
+"""
+        else:
+            html_content += """
+            <div class="empty-state">
+                <div class="empty-icon">&#9989;</div>
+                <div class="empty-text">No token compromise detected</div>
+            </div>
+"""
+        
+        html_content += """
+        </section>
+"""
+
+        # Add YAML Rule Findings section
+        if rule_findings:
+            html_content += f"""
+        <section class="section">
+            <div class="section-header">
+                <div class="section-icon green">&#128269;</div>
+                <h2 class="section-title">YAML Rule Detections</h2>
+                <span class="risk-badge medium">{len(rule_findings)} Rules Triggered</span>
+            </div>
+            <div class="summary-grid" style="grid-template-columns: repeat(3, 1fr); margin-bottom: 24px;">
+                <div class="metric-card">
+                    <div class="metric-value critical">{critical_count}</div>
+                    <div class="metric-label">Critical</div>
+                </div>
+                <div class="metric-card">
+                    <div class="metric-value warning">{high_count}</div>
+                    <div class="metric-label">High</div>
+                </div>
+                <div class="metric-card">
+                    <div class="metric-value">{medium_count}</div>
+                    <div class="metric-label">Medium</div>
+                </div>
+            </div>
+"""
+            for rule_id, data in rule_findings.items():
+                severity = data['severity'].lower()
+                badge_class = 'critical' if severity == 'critical' else ('high' if severity == 'high' else 'medium')
+                html_content += f"""
+            <div class="rule-item">
+                <div class="rule-info">
+                    <div class="rule-title">{data['title']}</div>
+                    <div class="rule-count">{data['count']} matches found</div>
+                </div>
+                <span class="risk-badge {badge_class}">{data['severity']}</span>
+            </div>
+"""
+            html_content += """
+        </section>
+"""
+
+        html_content += """
+        <footer class="report-footer">
+            <span class="footer-brand">Ryoshi</span> M365 eDiscovery Detection Engine | Enterprise Security Report
+            <div style="margin-top: 8px; color: #999;">Confidential - For authorized recipients only</div>
+        </footer>
+    </main>
+</body>
+</html>
+"""
+
+        html_path = os.path.join(output_dir, 'ryoshi_detection_report.html')
+        with open(html_path, 'w', encoding='utf-8') as f:
+            f.write(html_content)
+        print(f"[+] HTML report saved: {html_path}")
+
+    def _generate_markdown_report(self, output_dir, report, rule_findings):
+        """Generate Markdown detection report"""
+        
+        critical_count = sum(1 for d in self.rule_detections.values() if d['severity'] == 'CRITICAL' and d['count'] > 0)
+        high_count = sum(1 for d in self.rule_detections.values() if d['severity'] == 'HIGH' and d['count'] > 0)
+        medium_count = sum(1 for d in self.rule_detections.values() if d['severity'] == 'MEDIUM' and d['count'] > 0)
+        
+        md_content = f"""# Ryoshi M365 eDiscovery Detection Report
+
+**Generated**: {report['generated_at']}
+
+## Executive Summary
+
+| Metric | Value |
+|--------|-------|
+| Total Events Analyzed | {report['total_events_analyzed']:,} |
+| Unique IPs Found | {report.get('unique_ips_found', 0)} |
+| Rules Loaded | {report['rules_loaded']} |
+| Credential Theft Incidents | {report['detections']['credential_theft']} |
+| Token Compromise Incidents | {report['detections']['token_compromise']} |
+| Rule-Based Findings | {report['detections']['rule_based_findings']} |
+
+## Credential Theft Detections
+
+"""
+        if self.compromises['credential_theft']:
+            for finding in self.compromises['credential_theft']:
+                md_content += f"""
+### {finding['user']}
+
+| Field | Value |
+|-------|-------|
+| Duration | {finding['duration_hours']:.2f} hours |
+| Unique Sessions | {finding['unique_sessions']} |
+| Unique IPs | {finding['unique_ips']} |
+| Login Count | {finding['login_count']} |
+| First Seen | {finding['first_seen']} |
+| Last Seen | {finding['last_seen']} |
+| IP Addresses | {', '.join(finding['ip_addresses'][:10])} |
+
+"""
+        else:
+            md_content += "No credential theft detected.\n"
+
+        md_content += "\n## Token Compromise Detections\n\n"
+        
+        if self.compromises['token_compromise']:
+            for finding in self.compromises['token_compromise']:
+                users = ', '.join(finding['users']) if finding['users'] else 'Unknown'
+                md_content += f"""
+### Session: {finding['session_id'][:36]}...
+
+| Field | Value |
+|-------|-------|
+| Users | {users} |
+| Unique IPs | {finding['unique_ips']} |
+| Operations | {finding['operation_count']:,} |
+| KMSI Enabled | {'Yes' if finding['kmsi_enabled'] else 'No'} |
+| Duration | {finding['duration_hours']:.2f} hours |
+| First Seen | {finding['first_seen']} |
+| Last Seen | {finding['last_seen']} |
+
+"""
+        else:
+            md_content += "No token compromise detected.\n"
+
+        if rule_findings:
+            md_content += f"""
+## YAML Rule Detections
+
+| Severity | Count |
+|----------|-------|
+| Critical | {critical_count} |
+| High | {high_count} |
+| Medium | {medium_count} |
+
+### Triggered Rules
+
+"""
+            for rule_id, data in rule_findings.items():
+                md_content += f"- **{data['title']}** ({data['severity']}) - {data['count']} matches\n"
+
+        md_content += "\n---\n*Ryoshi M365 eDiscovery Detection Engine*\n"
+
+        md_path = os.path.join(output_dir, 'ryoshi_detection_report.md')
+        with open(md_path, 'w', encoding='utf-8') as f:
+            f.write(md_content)
+        print(f"[+] Markdown report saved: {md_path}")
 
     def print_summary(self):
         """Print summary of findings"""
