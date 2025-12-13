@@ -1,0 +1,80 @@
+title: Failed Login Followed by Success - Password Spray/Brute Force
+id: ryoshi-m365-failed-then-success-login
+status: experimental
+description: |
+  Detects pattern where multiple failed login attempts are followed by a
+  successful login, indicating potential:
+  - Successful password spray attack
+  - Brute force credential guessing
+  - Credential stuffing from leaked passwords
+  
+  129 UserLoginFailed events detected in sample data.
+severity: HIGH
+logsource:
+  category: authentication
+  product: M365
+  service: AzureActiveDirectory
+detection:
+  selection_failed:
+    operation: UserLoginFailed
+  selection_success:
+    operation: UserLoggedIn
+    result_status: Success
+  correlation:
+    by: user_id
+    sequence:
+      - selection_failed: ">=3"
+      - selection_success
+    timeframe: 1h
+  condition: correlation
+output_fields:
+  - timestamp: CreationDate
+  - user: UserIds
+  - operation: Operations
+  - result_status: ResultStatus
+  - error_code: ErrorCode
+  - client_ip: ClientIP
+  - user_agent: UserAgent
+  - device_properties: DeviceProperties
+report:
+  title: "Failed Login Followed by Success - Potential Credential Attack"
+  severity: HIGH
+  template: |
+    User: {user}
+    
+    Attack Timeline:
+    - Failed Attempts: {failed_count}
+    - First Failure: {first_failed}
+    - Last Failure: {last_failed}
+    - Successful Login: {success_timestamp}
+    
+    Attack Details:
+    - Source IPs Used: {unique_ips}
+    - Error Codes: {error_codes}
+    - Time to Success: {time_to_success} minutes
+    
+    Successful Login Info:
+    - IP: {success_ip}
+    - User Agent: {user_agent}
+    - Device: {device_name}
+    
+    Attack Pattern Indicators:
+    - Multiple failures before success
+    - Possible password spray/brute force
+    - Credential may be compromised
+    
+    IMMEDIATE ACTIONS:
+    - Force password reset
+    - Enable MFA if not enabled
+    - Check for post-login suspicious activity
+    - Block source IPs
+falsepositives:
+  - User forgot password and tried multiple times
+  - Cached credentials on old devices
+  - Password recently changed
+mitigation:
+  - Force immediate password reset
+  - Enable MFA
+  - Block attacking IP addresses
+  - Review all activity after successful login
+  - Check if password was found in breach databases

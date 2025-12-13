@@ -1,0 +1,74 @@
+title: SendAs Operation - Potential BEC Attack
+id: ryoshi-m365-sendas-impersonation
+status: experimental
+description: |
+  Detects SendAs operations where an attacker sends emails impersonating the
+  compromised user. This is a key indicator of Business Email Compromise (BEC):
+  - Sending fraudulent payment requests
+  - Impersonating executives to authorize wire transfers
+  - Spreading phishing to internal contacts
+  - Requesting sensitive information from colleagues
+  
+  465 SendAs operations detected in sample data analysis.
+severity: CRITICAL
+logsource:
+  category: email_send
+  product: M365
+  service: Exchange
+detection:
+  selection:
+    operation:
+      - SendAs
+      - SendOnBehalf
+  filter_suspicious:
+    OR:
+      - external_recipient: "true"
+      - attachment_present: "true"
+      - keywords_financial: ["invoice", "payment", "wire", "transfer", "urgent", "confidential"]
+  condition: selection
+output_fields:
+  - timestamp: CreationDate
+  - user: UserIds
+  - operation: Operations
+  - recipients: Recipients
+  - subject: Item.Subject
+  - has_attachment: Item.Attachments
+  - client_ip: ClientIP
+  - session_id: SessionId
+report:
+  title: "SendAs/Impersonation Detection - Potential BEC"
+  severity: CRITICAL
+  template: |
+    Sender (Impersonated): {user}
+    Operation: {operation}
+    Timestamp: {timestamp}
+    
+    Email Details:
+    - Recipients: {recipients}
+    - Subject: {subject}
+    - Has Attachments: {has_attachment}
+    
+    Session Info:
+    - Source IP: {client_ip}
+    - Session ID: {session_id}
+    
+    BEC Risk Indicators:
+    - Impersonation of legitimate user
+    - Potential fraudulent communications
+    - Check for financial/sensitive content
+    
+    IMMEDIATE ACTIONS:
+    - Contact recipients to warn them
+    - Review email content for fraud
+    - Check if wire transfers were requested
+    - Notify security/fraud team
+falsepositives:
+  - Delegated mailbox access (executive assistants)
+  - Shared mailbox legitimate use
+  - Authorized Send-As permissions for service accounts
+mitigation:
+  - Recall sent messages if possible
+  - Contact all recipients immediately
+  - Disable SendAs permissions
+  - Review all emails sent during compromise window
+  - Notify external recipients of potential fraud

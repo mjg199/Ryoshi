@@ -1,0 +1,82 @@
+title: Mass File Download - Data Exfiltration
+id: ryoshi-m365-mass-file-download
+status: experimental
+description: |
+  Detects mass file downloads from SharePoint/OneDrive indicating potential
+  data exfiltration. Attackers with compromised credentials often download
+  large amounts of files before losing access.
+  
+  Based on sample analysis:
+  - 5,368 FileSyncDownloadedFull operations
+  - 777 FileDownloaded operations
+  - 9,558 FileAccessed operations
+severity: HIGH
+logsource:
+  category: file_operations
+  product: M365
+  service: SharePoint
+detection:
+  selection:
+    operation:
+      - FileDownloaded
+      - FileSyncDownloadedFull
+      - FileAccessed
+    workload:
+      - SharePoint
+      - OneDriveBusiness
+  aggregation:
+    field: session_id
+    count: ">=50"
+    timeframe: 1h
+  condition: selection and aggregation
+output_fields:
+  - timestamp: CreationDate
+  - user: UserIds
+  - operation: Operations
+  - file_name: SourceFileName
+  - file_path: SourceRelativeUrl
+  - site_url: SiteUrl
+  - client_ip: ClientIP
+  - session_id: SessionId
+  - file_extension: SourceFileExtension
+report:
+  title: "Mass File Download Detection"
+  severity: HIGH
+  template: |
+    User: {user}
+    Session: {session_id}
+    Time Window: {first_seen} - {last_seen}
+    
+    Download Statistics:
+    - Total Files: {file_count}
+    - Unique Sites: {site_count}
+    - Duration: {duration_minutes} minutes
+    
+    File Types Downloaded:
+    {file_extensions_summary}
+    
+    Source IP: {client_ip}
+    
+    Sites Accessed:
+    {sites_accessed}
+    
+    Risk Assessment:
+    - High volume file access detected
+    - Potential data exfiltration in progress
+    - Check for sensitive/confidential files
+    
+    Recommended Actions:
+    - Block user access immediately
+    - Review files downloaded for classification
+    - Check DLP alerts for sensitive content
+    - Preserve evidence for investigation
+falsepositives:
+  - OneDrive sync client initial setup
+  - Legitimate backup operations
+  - Project handover file transfers
+  - IT migration activities
+mitigation:
+  - Revoke user sessions immediately
+  - Review downloaded file classifications
+  - Enable DLP to block sensitive file downloads
+  - Audit file sharing permissions

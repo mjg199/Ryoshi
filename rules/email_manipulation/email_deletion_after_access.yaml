@@ -1,0 +1,78 @@
+title: Email Deletion After Access - Evidence Destruction
+id: ryoshi-m365-email-deletion-after-access
+status: experimental
+description: |
+  Detects pattern where emails are deleted (SoftDelete, HardDelete, MoveToDeletedItems)
+  shortly after being accessed. This behavior indicates:
+  - Attacker covering tracks after reading sensitive emails
+  - Destruction of evidence (security alerts, password resets)
+  - Hiding unauthorized access from the legitimate user
+  
+  Based on log analysis: 3,182 SoftDelete + 346 HardDelete + 4,903 MoveToDeletedItems
+  operations observed in sample data.
+severity: MEDIUM
+logsource:
+  category: email_manipulation
+  product: M365
+  service: Exchange
+detection:
+  selection_access:
+    operation: MailItemsAccessed
+    result_status: Succeeded
+  selection_delete:
+    operation:
+      - SoftDelete
+      - HardDelete
+      - MoveToDeletedItems
+  correlation:
+    by: session_id
+    sequence:
+      - selection_access
+      - selection_delete
+    timeframe: 30m
+  condition: correlation
+output_fields:
+  - timestamp: CreationDate
+  - user: UserIds
+  - operation: Operations
+  - item_id: AffectedItems.Id
+  - subject: AffectedItems.Subject
+  - session_id: SessionId
+  - client_ip: ClientIP
+report:
+  title: "Email Deletion After Access Detection"
+  severity: MEDIUM
+  template: |
+    User: {user}
+    Session: {session_id}
+    
+    Access-Delete Pattern:
+    - Email Accessed: {access_timestamp}
+    - Email Deleted: {delete_timestamp}
+    - Time Between: {time_delta} minutes
+    
+    Deleted Item:
+    - Subject: {subject}
+    - Item ID: {item_id}
+    - Delete Method: {operation}
+    
+    Source IP: {client_ip}
+    
+    Potential Indicators:
+    - Evidence destruction behavior
+    - Covering tracks after unauthorized access
+    - Hiding activity from legitimate user
+    
+    Recovery Actions:
+    - Check Recoverable Items folder
+    - Enable litigation hold if not already enabled
+    - Preserve mailbox for forensic analysis
+falsepositives:
+  - Normal email hygiene/cleanup
+  - Automated retention policy enforcement
+  - User deleting spam after reviewing
+mitigation:
+  - Enable litigation hold on mailbox
+  - Recover deleted items from dumpster
+  - Review all deleted items for sensitivity
+  - Preserve logs for investigation

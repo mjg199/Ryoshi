@@ -1,0 +1,70 @@
+title: Bulk Email Access - Potential Data Exfiltration
+id: ryoshi-m365-bulk-email-access
+status: experimental
+description: |
+  Detects when a user or session accesses an unusually high number of email
+  items in a short period. This pattern indicates potential:
+  - Mass email download for exfiltration
+  - Automated scraping of mailbox contents
+  - Attacker harvesting sensitive information post-compromise
+  
+  Based on analysis of 95,941 M365 events where MailItemsAccessed was the
+  most common operation (39,247 events / 41% of total).
+severity: HIGH
+logsource:
+  category: email_access
+  product: M365
+  service: Exchange
+detection:
+  selection:
+    operation: MailItemsAccessed
+    result_status: Succeeded
+  aggregation:
+    field: session_id
+    count: ">=500"
+    timeframe: 1h
+  condition: selection and aggregation
+output_fields:
+  - timestamp: CreationDate
+  - user: UserIds
+  - session_id: AppAccessContext.AADSessionId
+  - client_ip: ClientIP
+  - mail_items_count: count
+  - folders_accessed: Folders
+  - workload: Workload
+report:
+  title: "Bulk Email Access Detection"
+  severity: HIGH
+  template: |
+    User: {user}
+    Session: {session_id}
+    Time Window: {first_seen} - {last_seen}
+    
+    Access Statistics:
+    - Emails Accessed: {mail_items_count}
+    - Unique Folders: {folders_accessed}
+    - Duration: {duration_minutes} minutes
+    - Rate: {access_rate} emails/minute
+    
+    Source IP: {client_ip}
+    
+    Risk Indicators:
+    - High volume email access in short period
+    - Potential automated/scripted access
+    - Possible data exfiltration preparation
+    
+    Recommended Actions:
+    - Review accessed email content/sensitivity
+    - Check for subsequent Send/Forward operations
+    - Verify if access was user-initiated
+    - Look for file downloads in same session
+falsepositives:
+  - Email migration or backup operations
+  - eDiscovery searches by authorized personnel
+  - Legitimate bulk email review for legal/compliance
+  - Mobile app initial sync
+mitigation:
+  - Suspend compromised account
+  - Revoke active sessions
+  - Audit all accessed emails for sensitivity
+  - Enable DLP policies to prevent exfiltration

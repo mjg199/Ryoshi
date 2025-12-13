@@ -1,0 +1,70 @@
+title: Suspicious Inbox Rule Creation - Auto-Forward or Delete
+id: ryoshi-m365-suspicious-inbox-rule
+status: experimental
+description: |
+  Detects creation of inbox rules that automatically forward emails to external
+  addresses or delete messages. Attackers commonly create these rules to:
+  - Exfiltrate sensitive emails to attacker-controlled addresses
+  - Hide their activities by deleting security notifications
+  - Maintain persistence by forwarding password reset emails
+severity: HIGH
+logsource:
+  category: email_rules
+  product: M365
+  service: Exchange
+detection:
+  selection:
+    operation:
+      - New-InboxRule
+      - Set-InboxRule
+      - Enable-InboxRule
+  filter_forward:
+    parameters:
+      - ForwardTo: "*"
+      - ForwardAsAttachmentTo: "*"
+      - RedirectTo: "*"
+  filter_delete:
+    parameters:
+      - DeleteMessage: "True"
+      - MoveToFolder: "Deleted Items"
+      - MarkAsRead: "True"
+  condition: selection and (filter_forward or filter_delete)
+output_fields:
+  - timestamp: CreationDate
+  - user: UserIds
+  - operation: Operations
+  - rule_name: Parameters.Name
+  - forward_to: Parameters.ForwardTo
+  - delete_action: Parameters.DeleteMessage
+  - client_ip: ClientIP
+  - session_id: SessionId
+report:
+  title: "Suspicious Inbox Rule Detection"
+  severity: HIGH
+  template: |
+    User: {user}
+    Rule Created: {timestamp}
+    Operation: {operation}
+    Rule Name: {rule_name}
+    
+    Suspicious Actions:
+    - Forward To: {forward_to}
+    - Delete Messages: {delete_action}
+    
+    Source IP: {client_ip}
+    Session: {session_id}
+    
+    Immediate Actions:
+    - Review and disable the inbox rule
+    - Check if rule forwards to external domain
+    - Audit all emails forwarded since rule creation
+    - Reset user credentials if unauthorized
+falsepositives:
+  - Legitimate email forwarding for vacation
+  - IT-managed rules for compliance archiving
+  - User-created filters for spam management
+mitigation:
+  - Disable suspicious inbox rules immediately
+  - Block external forwarding at organization level
+  - Enable mailbox auditing
+  - Review all forwarded messages

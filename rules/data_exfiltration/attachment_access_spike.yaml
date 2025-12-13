@@ -1,0 +1,69 @@
+title: Attachment Access Spike - Targeted Data Theft
+id: ryoshi-m365-attachment-access-spike
+status: experimental
+description: |
+  Detects when a session accesses an unusually high number of email
+  attachments in a short period. Attachments often contain the most
+  sensitive data (contracts, financial docs, credentials).
+  
+  728 AttachmentAccess operations in sample data indicates attackers
+  specifically target attachments for exfiltration.
+severity: MEDIUM
+logsource:
+  category: email_access
+  product: M365
+  service: Exchange
+detection:
+  selection:
+    operation: AttachmentAccess
+  aggregation:
+    field: session_id
+    count: ">=20"
+    timeframe: 30m
+  condition: selection and aggregation
+output_fields:
+  - timestamp: CreationDate
+  - user: UserIds
+  - operation: Operations
+  - attachment_name: AttachmentName
+  - attachment_size: AttachmentSize
+  - parent_message: ParentMessage.Subject
+  - client_ip: ClientIP
+  - session_id: SessionId
+report:
+  title: "Attachment Access Spike Detection"
+  severity: MEDIUM
+  template: |
+    User: {user}
+    Session: {session_id}
+    Time Window: {first_seen} - {last_seen}
+    
+    Attachment Statistics:
+    - Total Attachments Accessed: {attachment_count}
+    - Total Size: {total_size_mb} MB
+    - Duration: {duration_minutes} minutes
+    
+    Top Attachment Types:
+    {attachment_types}
+    
+    Source IP: {client_ip}
+    
+    Risk Assessment:
+    - Targeted attachment harvesting detected
+    - Attachments often contain sensitive data
+    - Check file types for confidential info
+    
+    Recommended Actions:
+    - Review attachment content/sensitivity
+    - Check if attachments contain PII/financial data
+    - Verify user legitimacy
+    - Enable attachment DLP policies
+falsepositives:
+  - Legitimate document review for projects
+  - Legal/compliance email review
+  - Auditor access to historical emails
+mitigation:
+  - Review accessed attachments for sensitivity
+  - Enable sensitivity labels on documents
+  - Configure DLP for attachment scanning
+  - Audit attachment sharing permissions
