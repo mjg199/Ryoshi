@@ -204,12 +204,6 @@ Example AuditData fields parsed:
 - ✅ IP and session tracking across logs
 - ✅ KMSI persistence detection
 
-### Testing Results
-- ✅ Tested on 50,000+ event samples
-- ✅ Detected 13 token compromise incidents in sample data
-- ✅ All 9 rules loaded and executed successfully
-- ✅ Performance: processes 50K events in <5 seconds
-
 ## 🔗 References
 
 - [Microsoft 365 Unified Audit Log](https://docs.microsoft.com/en-us/microsoft-365/compliance/search-the-audit-log-in-security-and-compliance)
