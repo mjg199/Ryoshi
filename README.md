@@ -119,8 +119,9 @@ This is useful when:
 ### Output
 
 The engine generates:
+- **Output** The default output directory is saved to `/tmp/ryoshi_detection_report.json` you can change it by using the -o flag
 - **Console Summary**: Detection counts by severity and type
-- **JSON Report**: Detailed findings saved to `/tmp/ryoshi_detection_report.json`
+- **JSON Report**: Detailed findings 
 - **HTML Report**: Interactive detection dashboard with IP reputation data
 - **Timeline Reports**: Activity timelines for compromised users (JSON & CSV)
 
