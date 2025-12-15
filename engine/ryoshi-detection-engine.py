@@ -92,7 +92,7 @@ def check_abuseipdb(ip, api_key=None):
             'maxAgeInDays': 90
         }
         
-        response = requests.get(url, headers=headers, params=params, timeout=5)
+        response = requests.get(url, headers=headers, params=params, timeout=10, verify=True)
         if response.status_code == 200:
             data = response.json().get('data', {})
             result = {
@@ -107,8 +107,18 @@ def check_abuseipdb(ip, api_key=None):
             }
             ABUSEIPDB_CACHE[ip] = result
             return result
+        elif response.status_code == 401:
+            print(f"    [!] AbuseIPDB: Invalid API key")
+            return None
+        elif response.status_code == 429:
+            print(f"    [!] AbuseIPDB: Rate limit exceeded")
+            return None
+    except requests.exceptions.SSLError as e:
+        print(f"    [!] AbuseIPDB SSL error for {ip}: {str(e)[:50]}")
+    except requests.exceptions.Timeout:
+        print(f"    [!] AbuseIPDB timeout for {ip}")
     except Exception as e:
-        pass
+        print(f"    [!] AbuseIPDB error for {ip}: {str(e)[:50]}")
     
     return None
 
@@ -172,7 +182,7 @@ def get_default_rules_dir():
 
 
 class RyoshiDetectionEngine:
-    def __init__(self, rules_dir=None, abuseipdb_key=None):
+    def __init__(self, rules_dir=None, abuseipdb_key=None, exclude_countries=None):
         self.logs = []
         self.rules = {}
         self.rule_detections = {}  # All detections from YAML rules
@@ -181,6 +191,29 @@ class RyoshiDetectionEngine:
         self.ip_reputation = {}  # Store IP reputation data for reports
         self.ip_geolocation = {}  # Store IP geolocation data
         self.abuseipdb_key = abuseipdb_key or ABUSEIPDB_API_KEY
+        # Normalize excluded countries to lowercase for comparison
+        self.exclude_countries = set()
+        if exclude_countries:
+            for c in exclude_countries:
+                self.exclude_countries.add(c.lower())
+                # Also add common country code mappings
+                country_codes = {
+                    'spain': 'ES', 'es': 'ES',
+                    'united states': 'US', 'usa': 'US', 'us': 'US',
+                    'united kingdom': 'GB', 'uk': 'GB', 'gb': 'GB',
+                    'germany': 'DE', 'de': 'DE',
+                    'france': 'FR', 'fr': 'FR',
+                    'italy': 'IT', 'it': 'IT',
+                    'portugal': 'PT', 'pt': 'PT',
+                    'netherlands': 'NL', 'nl': 'NL',
+                    'belgium': 'BE', 'be': 'BE',
+                    'norway': 'NO', 'no': 'NO',
+                    'sweden': 'SE', 'se': 'SE',
+                    'ireland': 'IE', 'ie': 'IE',
+                    'nigeria': 'NG', 'ng': 'NG',
+                }
+                if c.lower() in country_codes:
+                    self.exclude_countries.add(country_codes[c.lower()].lower())
         
         # Auto-discover rules directory
         if rules_dir is None:
@@ -620,12 +653,13 @@ class RyoshiDetectionEngine:
             ip_details = []
             countries = set()
             suspicious_ips = []
+            excluded_ips = []  # IPs from excluded countries
             total_abuse_score = 0
             
             print(f"    [*] Session {session_id[:25]}... has {subnet_count} subnets - checking geolocation...")
             
             for ip in list(data['ips'])[:20]:  # Limit to first 20 IPs for performance
-                ip_info = {'ip': ip, 'country': 'Unknown', 'city': '', 'abuse_score': 0}
+                ip_info = {'ip': ip, 'country': 'Unknown', 'city': '', 'abuse_score': 0, 'excluded': False}
                 
                 # Get geolocation
                 geo = get_ip_geolocation(ip)
@@ -636,7 +670,16 @@ class RyoshiDetectionEngine:
                     ip_info['lat'] = geo.get('lat', 0)
                     ip_info['lon'] = geo.get('lon', 0)
                     ip_info['isp'] = geo.get('isp', '')
-                    countries.add(geo.get('countryCode', 'Unknown'))
+                    
+                    # Check if this country should be excluded
+                    country_code = geo.get('countryCode', '').lower()
+                    country_name = geo.get('country', '').lower()
+                    if country_code in self.exclude_countries or country_name in self.exclude_countries:
+                        ip_info['excluded'] = True
+                        excluded_ips.append(ip)
+                    else:
+                        countries.add(geo.get('countryCode', 'Unknown'))
+                    
                     self.ip_geolocation[ip] = geo
                 
                 # Check AbuseIPDB
@@ -655,6 +698,24 @@ class RyoshiDetectionEngine:
                 
                 ip_details.append(ip_info)
             
+            # Filter: If all IPs are from excluded countries, skip this session
+            non_excluded_ips = [ip for ip in ip_details if not ip.get('excluded', False)]
+            if len(non_excluded_ips) == 0:
+                print(f"        [~] Skipped - all IPs from excluded countries ({', '.join(set(self.exclude_countries))})")
+                continue
+            
+            # Recalculate subnet count excluding excluded country IPs
+            non_excluded_subnets = set()
+            for ip_info in non_excluded_ips:
+                subnet = get_subnet_24(ip_info['ip'])
+                if subnet:
+                    non_excluded_subnets.add(subnet)
+            
+            # If filtered subnets don't meet threshold, skip
+            if len(non_excluded_subnets) < min_subnets:
+                print(f"        [~] Skipped - only {len(non_excluded_subnets)} subnets after excluding {len(excluded_ips)} IPs from {', '.join(set(self.exclude_countries))}")
+                continue
+            
             # Calculate risk indicators
             multi_country = len(countries) > 1
             high_abuse_score = total_abuse_score / max(len(data['ips']), 1) > 15
@@ -662,8 +723,8 @@ class RyoshiDetectionEngine:
             
             # Determine detection reason
             detection_reasons = []
-            if subnet_count >= min_subnets:
-                detection_reasons.append(f"{subnet_count} distinct /24 subnets")
+            if len(non_excluded_subnets) >= min_subnets:
+                detection_reasons.append(f"{len(non_excluded_subnets)} distinct /24 subnets (excl. {len(excluded_ips)} IPs from allowed countries)")
             if multi_country:
                 detection_reasons.append(f"Multi-country access ({', '.join(countries)})")
             if has_suspicious_ips:
@@ -676,10 +737,12 @@ class RyoshiDetectionEngine:
                 'ips': list(data['ips']),
                 'session_id': session_id,
                 'unique_ips': len(data['ips']),
-                'unique_subnets_24': subnet_count,
+                'unique_subnets_24': len(non_excluded_subnets),
                 'unique_subnets_16': len(data['subnets_16']),
                 'event_count': len(data['events']),
                 'countries': list(countries),
+                'excluded_countries': list(set(ip['countryCode'] for ip in ip_details if ip.get('excluded'))),
+                'excluded_ip_count': len(excluded_ips),
                 'multi_country': multi_country,
                 'ip_details': ip_details,
                 'suspicious_ips': suspicious_ips,
@@ -1977,6 +2040,14 @@ Examples:
         help='AbuseIPDB API key for IP reputation checks (can also use ABUSEIPDB_API_KEY env var)'
     )
     
+    parser.add_argument(
+        '--exclude-country',
+        action='append',
+        dest='exclude_countries',
+        metavar='COUNTRY',
+        help='Exclude IPs from this country in token theft detection (can be used multiple times). Example: --exclude-country=Spain --exclude-country=France'
+    )
+    
     args = parser.parse_args()
     
     if not args.files and not args.folders:
@@ -1993,8 +2064,12 @@ Examples:
         print("[*] AbuseIPDB integration disabled (no API key provided)")
         print("    Use --abuseipdb-key or set ABUSEIPDB_API_KEY environment variable")
     
-    # Initialize engine with rules directory and API key
-    engine = RyoshiDetectionEngine(rules_dir=args.rules_dir, abuseipdb_key=abuseipdb_key)
+    # Check for excluded countries
+    if args.exclude_countries:
+        print(f"[+] Excluding countries from token theft detection: {', '.join(args.exclude_countries)}")
+    
+    # Initialize engine with rules directory, API key, and excluded countries
+    engine = RyoshiDetectionEngine(rules_dir=args.rules_dir, abuseipdb_key=abuseipdb_key, exclude_countries=args.exclude_countries)
     
     if args.files:
         for filepath in args.files:

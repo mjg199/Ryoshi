@@ -50,10 +50,11 @@ Ryoshi/
 
 ### Installation
 
-Requires Python 3.7+ and PyYAML:
+Requires Python 3.7+ and PyYAML. Optional: `requests` for IP geolocation and AbuseIPDB integration:
 
 ```bash
 pip install pyyaml
+pip install requests  # Optional: for IP geolocation and reputation checks
 ```
 
 ### Basic Usage
@@ -73,79 +74,128 @@ python3 engine/ryoshi-detection-engine.py -f file1.csv -f file2.csv -F /logs/fol
 # Custom rules directory
 python3 engine/ryoshi-detection-engine.py --rules-dir /custom/rules -f audit.csv
 
-# Only built-in detections (credential theft, token compromise)
-python3 engine/ryoshi-detection-engine.py --no-builtin -f audit.csv
+# Custom output directory
+python3 engine/ryoshi-detection-engine.py -f audit.csv -o /path/to/output/
 ```
+
+### Advanced Options
+
+#### IP Reputation Checking (AbuseIPDB)
+
+Enable IP reputation analysis for token theft detection:
+
+```bash
+# Using command-line argument
+python3 engine/ryoshi-detection-engine.py -f audit.csv --abuseipdb-key YOUR_API_KEY
+
+# Using environment variable
+export ABUSEIPDB_API_KEY="your_api_key_here"
+python3 engine/ryoshi-detection-engine.py -f audit.csv
+```
+
+When enabled, the engine will:
+- Query AbuseIPDB for IP abuse scores
+- Flag known TOR and proxy exit nodes
+- Include reputation data in HTML reports
+- Reduce false positives from known malicious infrastructure
+
+#### Country Exclusion for Token Theft Detection
+
+Filter out known legitimate locations to reduce false positives:
+
+```bash
+# Exclude single country (e.g., Spain)
+python3 engine/ryoshi-detection-engine.py -f audit.csv --exclude-country="Spain"
+
+# Exclude multiple countries (comma-separated)
+python3 engine/ryoshi-detection-engine.py -f audit.csv --exclude-country="Spain,France,Germany"
+```
+
+This is useful when:
+- Organization is primarily based in specific countries
+- Corporate VPN exits are in known locations
+- Legitimate users travel to certain regions regularly
 
 ### Output
 
 The engine generates:
 - **Console Summary**: Detection counts by severity and type
 - **JSON Report**: Detailed findings saved to `/tmp/ryoshi_detection_report.json`
-- **Timeline Reports**: Activity timelines for compromised users
+- **HTML Report**: Interactive detection dashboard with IP reputation data
+- **Timeline Reports**: Activity timelines for compromised users (JSON & CSV)
 
 Example output:
 ```
 [+] Ryoshi M365 eDiscovery Detection Engine (Rule-Based)
 ============================================================
+[+] AbuseIPDB integration enabled
+[+] Excluding countries from token theft detection: Spain
 [*] Loading rules from ./rules...
     [+] Credential Theft - Multiple Sessions from Diverse IPs
     [+] Token Compromise - Session Hijacking from Multiple IPs
     [+] Bulk Email Access - Potential Data Exfiltration
     ... (9 total rules loaded)
 
-[*] Loading logs from audit.csv
-[+] Successfully loaded 50000 events
-
-[*] Detecting credential theft (timeframe: 24h)...
-[*] Detecting token compromise (timeframe: 168h)...
-[!] TOKEN COMPROMISE DETECTED: a1b2c3d4...
-    User: user@company.com, IPs: 32, KMSI: False
-
 [*] Executing 9 YAML rules...
 --------------------------------------------------
-[!] Bulk Email Access - Potential Data Exfiltration
-    Severity: HIGH | Matches: 127
+[*] Analyzing 191 sessions for token theft indicators...
+    [*] Session 009988c9-a0c3-08e0-87eb-4... has 21 subnets - checking geolocation...
+    [*] Session 009988c9-9bfd-74ba-74b3-3... has 8 subnets - checking geolocation...
+
+[!] Token Compromise - Session Hijacking from Multiple IPs
+    Severity: CRITICAL | Sessions Affected: 8
+    - Session 009988c9-a0c3-08e0-8...: 21 IPs, 21 subnets
+      Countries: NO, ES, SE
+    - Session 009988c9-9bfd-74ba-7...: 11 IPs, 8 subnets
+      Countries: ES, FR, SE, IE
+      Suspicious IPs (AbuseIPDB): 4
 
 ============================================================
 RYOSHI DETECTION SUMMARY
 ============================================================
-Total events analyzed: 50000
+Total events analyzed: 19619
 Rules loaded: 9
+Compromised users: 2
 
-Built-in Detections:
-  Credential theft incidents: 0
-  Token compromise incidents: 13
-
-YAML Rule Detections (by severity):
-  CRITICAL: 0
-  HIGH: 2
-  MEDIUM: 1
+Rule Detections by Severity:
+  CRITICAL: 2
+  HIGH: 1
+  MEDIUM: 2
 ============================================================
 ```
 
 ## 🔍 Detection Capabilities
 
-### Built-in Detections (No Rules Required)
+### YAML Rule-Based Detections (Rule-Based Approach)
 
-1. **Credential Theft**: 2+ unique sessions from 2+ diverse IPs within 24 hours
-2. **Token Compromise**: Single session used from 2+ different IP addresses
+The engine dynamically loads and executes all YAML rules from the `rules/` folder. Rules are organized by threat category:
 
-### YAML Rule-Based Detections
+| Rule | Severity | Key Detection Method |
+|------|----------|-----|
+| **Credential Theft - Multiple Sessions** | CRITICAL | 2+ SessionIDs from 2+ IPs in 24h |
+| **Token Compromise - Session Hijacking** | CRITICAL | **Hybrid detection**: 3+ /24 subnets + geolocation + IP reputation |
+| **Bulk Email Access** | HIGH | 500+ MailItemsAccessed in 1 hour |
+| **Mass File Download** | HIGH | 50+ FileDownloaded in 1 hour |
+| **SendAs/BEC Impersonation** | CRITICAL | SendAs/SendOnBehalf operations |
+| **Suspicious Inbox Rule Creation** | HIGH | New-InboxRule/Set-InboxRule operations |
+| **Email Deletion After Access** | MEDIUM | SoftDelete/HardDelete patterns |
+| **Failed Login Then Success** | HIGH | UserLoginFailed followed by success in 1 hour |
+| **Attachment Access Spike** | MEDIUM | Unusual attachment access patterns |
 
-The engine automatically loads and executes all YAML rules from the `rules/` folder:
+### Token Compromise Detection (Enhanced)
 
-| Rule | Severity | Detection |
-|------|----------|-----------|
-| Credential Theft - Multiple Sessions | CRITICAL | 2+ SessionIDs from 2+ IPs in 24h |
-| Token Compromise - Session Hijacking | CRITICAL | Single SessionID from 2+ IPs |
-| Bulk Email Access | HIGH | 500+ MailItemsAccessed in 1 hour |
-| Mass File Download | HIGH | 50+ FileDownloaded in 1 hour |
-| SendAs/BEC Impersonation | CRITICAL | SendAs/SendOnBehalf operations |
-| Suspicious Inbox Rule Creation | HIGH | New-InboxRule/Set-InboxRule operations |
-| Email Deletion After Access | MEDIUM | SoftDelete/HardDelete patterns |
-| Failed Login Then Success | HIGH | UserLoginFailed followed by success |
-| Attachment Access Spike | MEDIUM | Unusual attachment access patterns |
+The token hijacking rule uses a **hybrid multi-layer approach**:
+
+1. **Subnet Diversity (Primary)**: Requires 3+ distinct /24 subnets to trigger
+2. **Geolocation Analysis**: Detects impossible travel (multiple countries)
+3. **IP Reputation** (Optional): AbuseIPDB integration checks for known malicious IPs
+4. **Country Filtering** (Optional): Excludes legitimate locations to reduce false positives
+
+**Example Detection:**
+- User in Spain with sessions from Nigeria, New Zealand, and Europe
+- 17 distinct subnets across 4 countries
+- 4 IPs flagged as suspicious by AbuseIPDB
+- Result: **CRITICAL** token theft alert
 
 ## 📚 Documentation
 
@@ -161,6 +211,13 @@ The engine automatically loads and executes all YAML rules from the `rules/` fol
 - ✅ **Recursive loading** - Scans all subdirectories for `*.yaml` files
 - ✅ **Custom paths** - Use `--rules-dir` to override default location
 
+### Token Compromise Detection
+- ✅ **Subnet diversity analysis** - 3+ /24 subnets required
+- ✅ **Geolocation checking** - Detects impossible travel via ip-api.com
+- ✅ **IP reputation integration** - AbuseIPDB API for abuse scores & TOR/proxy detection
+- ✅ **Country filtering** - Exclude known legitimate locations
+- ✅ **Multi-layer detection** - Reduces false positives from VPNs and corporate networks
+
 ### CSV Log Processing
 - ✅ **M365 Unified Audit Logs** - Parses CreationDate, Operations, AuditData (JSON embedded)
 - ✅ **Batch processing** - Analyze multiple files/folders in one run
@@ -169,16 +226,17 @@ The engine automatically loads and executes all YAML rules from the `rules/` fol
 ### Forensics Features
 - ✅ **IP extraction** - Captures ClientIP, ClientIPAddress, ActorIpAddress
 - ✅ **Session tracking** - Tracks SessionId, AADSessionId across operations
-- ✅ **KMSI detection** - Identifies Keep Me Signed In persistence
-- ✅ **Timeline building** - Creates activity timelines for compromised users
+- ✅ **Subnet mapping** - Calculates /16 and /24 subnets for diversity analysis
+- ✅ **Timeline building** - Creates activity timelines for compromised users (JSON & CSV)
 - ✅ **Severity classification** - CRITICAL, HIGH, MEDIUM categorization
+- ✅ **HTML reporting** - Interactive dashboard with IP reputation data
 
 ## 📋 Log Format Requirements
 
 Expected CSV columns:
 - `CreationDate` - ISO timestamp of the event
-- `UserIds` - User principal name or ID
-- `Operations` - The operation/activity name
+- `UserId` - User principal name or ID
+- `Operation` - The operation/activity name
 - `AuditData` - JSON object with detailed event information
 
 Example AuditData fields parsed:
@@ -191,13 +249,18 @@ Example AuditData fields parsed:
 
 ## 🛠️ Current Status
 
-**✅ Production Ready**: Full detection engine with 9 YAML rules and dynamic rule loading
+**✅ Production Ready**: Full rule-based detection engine with 9 YAML rules, IP geolocation, and AbuseIPDB integration
 
 ### What's Implemented
-- ✅ Python detection engine with rule-based architecture
+- ✅ Python detection engine with hybrid rule-based architecture
 - ✅ 9 YAML detection rules covering major M365 attack patterns
-- ✅ Built-in credential theft and token compromise detection
 - ✅ Automatic rule discovery and loading from `rules/` folder
+- ✅ Token compromise detection with subnet diversity analysis
+- ✅ IP geolocation (ip-api.com) for impossible travel detection
+- ✅ AbuseIPDB API integration for IP reputation checking
+- ✅ Country exclusion filtering to reduce false positives
+- ✅ Activity timeline generation for compromised users (JSON & CSV)
+- ✅ Multi-format reporting (JSON, HTML, Markdown, CSV)
 - ✅ CSV parsing for M365 Unified Audit Logs
 - ✅ JSON report generation with detailed findings
 - ✅ Activity timeline building for compromised users
