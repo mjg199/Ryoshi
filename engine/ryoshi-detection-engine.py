@@ -47,12 +47,9 @@ class RyoshiDetectionEngine:
     def __init__(self, rules_dir=None):
         self.logs = []
         self.rules = {}
-        self.compromises = {
-            'credential_theft': [],
-            'token_compromise': []
-        }
-        self.rule_detections = {}  # Detections from dynamic rules
+        self.rule_detections = {}  # All detections from YAML rules
         self.timelines = {}
+        self.compromised_users = set()  # Users flagged by critical rules
         
         # Auto-discover rules directory
         if rules_dir is None:
@@ -191,232 +188,6 @@ class RyoshiDetectionEngine:
                             return True
         return False
 
-    def detect_credential_theft(self, threshold_hours=24):
-        """Detect credential theft: multiple sessions from diverse IPs"""
-        print(f"\n[*] Detecting credential theft (timeframe: {threshold_hours}h)...")
-        
-        user_logins = defaultdict(list)
-        
-        for log_entry in self.logs:
-            if log_entry['operation'] == 'UserLoggedIn':
-                audit = log_entry.get('audit_data', {})
-                if audit.get('ResultStatus') == 'Success':
-                    user = log_entry['user_id']
-                    ips = self.extract_ip_addresses(log_entry)
-                    sessions = self.extract_session_ids(log_entry)
-                    
-                    try:
-                        ts = log_entry['timestamp'].replace('Z', '+00:00')
-                        if '.' not in ts:
-                            ts = ts.replace('+00:00', '.000000+00:00')
-                        timestamp = datetime.fromisoformat(ts.replace('+00:00', ''))
-                    except Exception:
-                        continue
-                    
-                    user_logins[user].append({
-                        'timestamp': timestamp,
-                        'ips': ips,
-                        'sessions': sessions,
-                        'kmsi': self.check_kmsi_enabled(log_entry),
-                        'raw': log_entry
-                    })
-        
-        for user, logins in user_logins.items():
-            if len(logins) < 2:
-                continue
-            
-            logins.sort(key=lambda x: x['timestamp'])
-            
-            unique_sessions = set()
-            unique_ips = set()
-            
-            for login in logins:
-                for sid_type, sid in login['sessions'].items():
-                    if sid:
-                        unique_sessions.add(sid)
-                unique_ips.update(login['ips'])
-            
-            if len(unique_sessions) >= 2 and len(unique_ips) >= 2:
-                time_range = logins[-1]['timestamp'] - logins[0]['timestamp']
-                
-                self.compromises['credential_theft'].append({
-                    'user': user,
-                    'unique_sessions': len(unique_sessions),
-                    'unique_ips': len(unique_ips),
-                    'session_ids': list(unique_sessions),
-                    'ip_addresses': list(unique_ips),
-                    'first_seen': logins[0]['timestamp'].isoformat(),
-                    'last_seen': logins[-1]['timestamp'].isoformat(),
-                    'duration_hours': time_range.total_seconds() / 3600,
-                    'login_count': len(logins)
-                })
-                print(f"[!] CREDENTIAL THEFT DETECTED: {user}")
-                print(f"    Sessions: {len(unique_sessions)}, IPs: {len(unique_ips)}")
-
-    def detect_token_compromise(self, threshold_hours=168):
-        """Detect token compromise: single session from multiple IPs"""
-        print(f"\n[*] Detecting token compromise (timeframe: {threshold_hours}h)...")
-        
-        session_usage = defaultdict(lambda: {
-            'ips': set(),
-            'users': set(),
-            'operations': [],
-            'kmsi': False,
-            'first_seen': None,
-            'last_seen': None
-        })
-        
-        for log_entry in self.logs:
-            sessions = self.extract_session_ids(log_entry)
-            ips = self.extract_ip_addresses(log_entry)
-            user = log_entry['user_id']
-            
-            try:
-                ts = log_entry['timestamp'].replace('Z', '+00:00')
-                if '.' not in ts:
-                    ts = ts.replace('+00:00', '.000000+00:00')
-                timestamp = datetime.fromisoformat(ts.replace('+00:00', ''))
-            except Exception:
-                continue
-            
-            for sid_type, sid in sessions.items():
-                if sid:
-                    session_usage[sid]['ips'].update(ips)
-                    session_usage[sid]['users'].add(user)
-                    session_usage[sid]['operations'].append({
-                        'operation': log_entry['operation'],
-                        'timestamp': timestamp
-                    })
-                    
-                    if self.check_kmsi_enabled(log_entry):
-                        session_usage[sid]['kmsi'] = True
-                    
-                    if session_usage[sid]['first_seen'] is None:
-                        session_usage[sid]['first_seen'] = timestamp
-                    session_usage[sid]['last_seen'] = timestamp
-        
-        for session_id, data in session_usage.items():
-            if len(data['ips']) >= 2:
-                duration = (data['last_seen'] - data['first_seen']).total_seconds() / 3600
-                
-                self.compromises['token_compromise'].append({
-                    'session_id': session_id,
-                    'users': list(data['users']),
-                    'unique_ips': len(data['ips']),
-                    'ip_addresses': list(data['ips']),
-                    'operation_count': len(data['operations']),
-                    'kmsi_enabled': data['kmsi'],
-                    'first_seen': data['first_seen'].isoformat(),
-                    'last_seen': data['last_seen'].isoformat(),
-                    'duration_hours': duration
-                })
-                
-                user_str = ', '.join(data['users'])
-                print(f"[!] TOKEN COMPROMISE DETECTED: {session_id[:36]}...")
-                print(f"    User: {user_str}, IPs: {len(data['ips'])}, KMSI: {data['kmsi']}")
-
-    def detect_bulk_email_access(self, threshold=500, timeframe_hours=1):
-        """Detect bulk email access - potential data exfiltration"""
-        print(f"\n[*] Detecting bulk email access ({threshold}+ in {timeframe_hours}h)...")
-        
-        session_email_access = defaultdict(list)
-        
-        for log_entry in self.logs:
-            if log_entry['operation'] == 'MailItemsAccessed':
-                sessions = self.extract_session_ids(log_entry)
-                
-                try:
-                    ts = log_entry['timestamp'].replace('Z', '+00:00')
-                    if '.' not in ts:
-                        ts = ts.replace('+00:00', '.000000+00:00')
-                    timestamp = datetime.fromisoformat(ts.replace('+00:00', ''))
-                except Exception:
-                    continue
-                
-                for sid_type, sid in sessions.items():
-                    if sid:
-                        session_email_access[sid].append(timestamp)
-        
-        for session_id, timestamps in session_email_access.items():
-            if len(timestamps) >= threshold:
-                print(f"[!] BULK EMAIL ACCESS DETECTED: {session_id[:36]}...")
-                print(f"    Emails Accessed: {len(timestamps)}")
-
-    def detect_sendas_operations(self):
-        """Detect SendAs operations - potential BEC attacks"""
-        print(f"\n[*] Detecting SendAs/Impersonation operations...")
-        
-        sendas_count = 0
-        for log_entry in self.logs:
-            if log_entry['operation'] in ['SendAs', 'SendOnBehalf']:
-                sendas_count += 1
-                if sendas_count <= 5:  # Print first 5
-                    print(f"[!] SENDAS DETECTED: {log_entry['user_id']} - {log_entry['timestamp']}")
-        
-        if sendas_count > 0:
-            print(f"[+] Total SendAs operations found: {sendas_count}")
-
-    def detect_email_deletions(self):
-        """Detect email deletion patterns"""
-        print(f"\n[*] Detecting email deletions (SoftDelete, HardDelete, MoveToDeletedItems)...")
-        
-        deletion_ops = ['SoftDelete', 'HardDelete', 'MoveToDeletedItems']
-        deletion_count = 0
-        
-        for log_entry in self.logs:
-            if log_entry['operation'] in deletion_ops:
-                deletion_count += 1
-        
-        print(f"[+] Total deletion operations found: {deletion_count}")
-
-    def detect_inbox_rules(self):
-        """Detect inbox rule creation"""
-        print(f"\n[*] Detecting inbox rule operations...")
-        
-        rule_ops = ['New-InboxRule', 'Set-InboxRule', 'Enable-InboxRule']
-        rule_count = 0
-        
-        for log_entry in self.logs:
-            if log_entry['operation'] in rule_ops:
-                rule_count += 1
-                if rule_count <= 3:  # Print first 3
-                    print(f"[!] INBOX RULE: {log_entry['user_id']} - {log_entry['operation']}")
-        
-        if rule_count > 0:
-            print(f"[+] Total inbox rule operations: {rule_count}")
-
-    def detect_failed_logins(self):
-        """Detect failed login patterns"""
-        print(f"\n[*] Detecting failed login attempts...")
-        
-        failed_count = 0
-        for log_entry in self.logs:
-            if log_entry['operation'] == 'UserLoginFailed':
-                failed_count += 1
-        
-        if failed_count > 0:
-            print(f"[+] Total failed login attempts: {failed_count}")
-
-    def detect_file_downloads(self, threshold=50, timeframe_hours=1):
-        """Detect mass file downloads"""
-        print(f"\n[*] Detecting mass file downloads ({threshold}+ in {timeframe_hours}h)...")
-        
-        download_ops = ['FileDownloaded', 'FileSyncDownloadedFull']
-        session_downloads = defaultdict(int)
-        
-        for log_entry in self.logs:
-            if log_entry['operation'] in download_ops:
-                sessions = self.extract_session_ids(log_entry)
-                for sid_type, sid in sessions.items():
-                    if sid:
-                        session_downloads[sid] += 1
-        
-        high_downloads = [s for s, c in session_downloads.items() if c >= threshold]
-        if high_downloads:
-            print(f"[!] MASS FILE DOWNLOAD DETECTED: {len(high_downloads)} sessions")
-            for sid in high_downloads[:3]:
-                print(f"    Session {sid[:36]}... : {session_downloads[sid]} downloads")
-
     def run_all_rules(self):
         """Execute all loaded YAML rules against the logs"""
         if not self.rules:
@@ -550,6 +321,13 @@ class RyoshiDetectionEngine:
         self.rule_detections[rule_id]['matches'] = matches[:10]
         self.rule_detections[rule_id]['count'] = len(matches)
         
+        # Track compromised users for timeline generation (CRITICAL severity only)
+        if matches and severity == 'CRITICAL':
+            for m in matches:
+                user = m.get('user', '')
+                if user and ',' not in user:  # Single user
+                    self.compromised_users.add(user)
+        
         if matches:
             print(f"\n[!] {rule_title}")
             print(f"    Severity: {severity} | Users Affected: {len(matches)}")
@@ -640,6 +418,13 @@ class RyoshiDetectionEngine:
         self.rule_detections[rule_id]['matches'] = matches[:10]
         self.rule_detections[rule_id]['count'] = len(matches)
         
+        # Track compromised users for timeline generation (HIGH+ severity)
+        if matches and severity in ['CRITICAL', 'HIGH']:
+            for m in matches:
+                user = m.get('user', '')
+                if user:
+                    self.compromised_users.add(user)
+        
         if matches:
             print(f"\n[!] {rule_title}")
             print(f"    Severity: {severity} | Users Affected: {len(matches)}")
@@ -689,6 +474,14 @@ class RyoshiDetectionEngine:
         
         self.rule_detections[rule_id]['matches'] = matches[:10]
         self.rule_detections[rule_id]['count'] = len(matches)
+        
+        # Track compromised users for timeline generation (CRITICAL severity)
+        if matches and severity == 'CRITICAL':
+            for m in matches:
+                users = m.get('user', '').split(', ')
+                for user in users:
+                    if user:
+                        self.compromised_users.add(user)
         
         if matches:
             print(f"\n[!] {rule_title}")
@@ -798,24 +591,35 @@ class RyoshiDetectionEngine:
                     'samples': data['matches']
                 }
         
-        # Calculate totals
+        # Calculate totals from rule findings
         total_unique_ips = set()
-        for finding in self.compromises['credential_theft']:
-            total_unique_ips.update(finding.get('ip_addresses', []))
-        for finding in self.compromises['token_compromise']:
-            total_unique_ips.update(finding.get('ip_addresses', []))
+        for rule_id, data in rule_findings.items():
+            for match in data.get('samples', []):
+                ips = match.get('ips', [])
+                if isinstance(ips, list):
+                    total_unique_ips.update(ips)
+        
+        # Count by category
+        credential_theft_count = sum(1 for rid in rule_findings if 'credential-theft' in rid)
+        token_compromise_count = sum(1 for rid in rule_findings if 'token-compromise' in rid)
+        
+        # Count severity levels
+        critical_count = sum(1 for d in rule_findings.values() if d['severity'] == 'CRITICAL')
+        high_count = sum(1 for d in rule_findings.values() if d['severity'] == 'HIGH')
+        medium_count = sum(1 for d in rule_findings.values() if d['severity'] == 'MEDIUM')
         
         report = {
             'generated_at': datetime.now().isoformat(),
             'total_events_analyzed': len(self.logs),
             'unique_ips_found': len(total_unique_ips),
             'rules_loaded': len(self.rules),
+            'compromised_users': list(self.compromised_users),
             'detections': {
-                'credential_theft': len(self.compromises['credential_theft']),
-                'token_compromise': len(self.compromises['token_compromise']),
-                'rule_based_findings': len(rule_findings)
+                'total_rules_triggered': len(rule_findings),
+                'critical': critical_count,
+                'high': high_count,
+                'medium': medium_count
             },
-            'builtin_findings': self.compromises,
             'rule_findings': rule_findings
         }
         
@@ -1450,53 +1254,79 @@ class RyoshiDetectionEngine:
                     <div class="metric-label">Rules Loaded</div>
                 </div>
                 <div class="metric-card">
-                    <div class="metric-value critical">{report['detections']['credential_theft']}</div>
-                    <div class="metric-label">Credential Theft</div>
-                </div>
-                <div class="metric-card">
-                    <div class="metric-value warning">{report['detections']['token_compromise']}</div>
-                    <div class="metric-label">Token Compromise</div>
+                    <div class="metric-value critical">{len(self.compromised_users)}</div>
+                    <div class="metric-label">Compromised Users</div>
                 </div>
                 <div class="metric-card">
                     <div class="metric-value critical">{critical_count}</div>
-                    <div class="metric-label">Critical Rules</div>
+                    <div class="metric-label">Critical Findings</div>
+                </div>
+                <div class="metric-card">
+                    <div class="metric-value warning">{high_count}</div>
+                    <div class="metric-label">High Findings</div>
                 </div>
             </div>
         </section>
-
+"""
+        
+        # Get rule-based credential theft findings
+        rule_credential_theft = []
+        for rule_id, data in self.rule_detections.items():
+            if data['count'] > 0 and 'credential-theft' in rule_id:
+                rule_credential_theft.extend(data['matches'])
+        
+        # Get rule-based token compromise findings
+        rule_token_compromise = []
+        for rule_id, data in self.rule_detections.items():
+            if data['count'] > 0 and 'token-compromise' in rule_id:
+                rule_token_compromise.extend(data['matches'])
+        
+        # Calculate totals
+        total_credential_theft = len(rule_credential_theft)
+        total_token_compromise = len(rule_token_compromise)
+        
+        html_content += f"""
         <section class="section">
             <div class="section-header">
                 <div class="section-icon red">&#128680;</div>
                 <h2 class="section-title">Credential Theft Detections</h2>
-                <span class="risk-badge critical">{report['detections']['credential_theft']} Found</span>
+                <span class="risk-badge critical">{total_credential_theft} Found</span>
             </div>
 """
         
-        if self.compromises['credential_theft']:
-            for finding in self.compromises['credential_theft']:
-                ip_tags = ''.join([f'<span class="ip-tag">{ip}</span>' for ip in finding['ip_addresses'][:10]])
-                if len(finding['ip_addresses']) > 10:
-                    ip_tags += f'<span class="ip-tag">+{len(finding["ip_addresses"]) - 10} more</span>'
+        # Show rule-based credential theft findings first (they have better correlation data)
+        if rule_credential_theft:
+            for finding in rule_credential_theft:
+                ip_list = finding.get('ips', [])
+                ip_tags = ''.join([f'<span class="ip-tag">{ip}</span>' for ip in ip_list[:10]])
+                if len(ip_list) > 10:
+                    ip_tags += f'<span class="ip-tag">+{len(ip_list) - 10} more</span>'
+                
+                unique_sessions = finding.get('unique_sessions', 'N/A')
+                unique_ips = finding.get('unique_ips', len(ip_list))
+                event_count = finding.get('event_count', 'N/A')
+                timestamp = finding.get('timestamp', '')[:19].replace('T', ' ')
+                
                 html_content += f"""
             <div class="finding-card critical">
                 <div class="finding-header">
-                    <span class="finding-title">{finding['user']}</span>
-                    <span class="risk-badge critical">Critical</span>
+                    <span class="finding-title">{finding.get('user', 'Unknown')}</span>
+                    <span class="risk-badge critical">Critical - Rule Detection</span>
                 </div>
                 <div class="finding-body">
                     <table class="data-table">
-                        <tr><td>Duration</td><td>{finding['duration_hours']:.2f} hours</td></tr>
-                        <tr><td>Unique Sessions</td><td><strong>{finding['unique_sessions']}</strong></td></tr>
-                        <tr><td>Unique IPs</td><td><strong>{finding['unique_ips']}</strong></td></tr>
-                        <tr><td>Login Count</td><td>{finding['login_count']}</td></tr>
-                        <tr><td>First Seen</td><td>{finding['first_seen'][:19].replace('T', ' ')}</td></tr>
-                        <tr><td>Last Seen</td><td>{finding['last_seen'][:19].replace('T', ' ')}</td></tr>
+                        <tr><td>Detection Type</td><td><strong>Correlation Analysis</strong></td></tr>
+                        <tr><td>Unique Sessions</td><td><strong>{unique_sessions}</strong></td></tr>
+                        <tr><td>Unique IPs</td><td><strong>{unique_ips}</strong></td></tr>
+                        <tr><td>Total Events</td><td>{event_count}</td></tr>
+                        <tr><td>First Activity</td><td>{timestamp}</td></tr>
                         <tr><td>IP Addresses</td><td><div class="ip-list">{ip_tags}</div></td></tr>
                     </table>
                 </div>
             </div>
 """
-        else:
+        
+        if not rule_credential_theft:
             html_content += """
             <div class="empty-state">
                 <div class="empty-icon">&#9989;</div>
@@ -1511,38 +1341,41 @@ class RyoshiDetectionEngine:
             <div class="section-header">
                 <div class="section-icon orange">&#9888;</div>
                 <h2 class="section-title">Token Compromise Detections</h2>
-                <span class="risk-badge high">{report['detections']['token_compromise']} Found</span>
+                <span class="risk-badge high">{total_token_compromise} Found</span>
             </div>
 """
-        
-        if self.compromises['token_compromise']:
-            for finding in self.compromises['token_compromise']:
-                users = ', '.join(finding['users']) if finding['users'] else 'Unknown'
-                kmsi_status = '<span class="status-yes">Yes</span>' if finding['kmsi_enabled'] else '<span class="status-no">No</span>'
-                ip_tags = ''.join([f'<span class="ip-tag">{ip}</span>' for ip in finding['ip_addresses'][:8]])
-                if len(finding['ip_addresses']) > 8:
-                    ip_tags += f'<span class="ip-tag">+{len(finding["ip_addresses"]) - 8} more</span>'
+
+        # Show rule-based token compromise findings
+        if rule_token_compromise:
+            for finding in rule_token_compromise:
+                ip_list = finding.get('ips', [])
+                ip_tags = ''.join([f'<span class="ip-tag">{ip}</span>' for ip in ip_list[:8]])
+                if len(ip_list) > 8:
+                    ip_tags += f'<span class="ip-tag">+{len(ip_list) - 8} more</span>'
+                
+                session_id = finding.get('session_id', 'Unknown')[:36]
+                unique_ips = finding.get('unique_ips', len(ip_list))
+                event_count = finding.get('event_count', 'N/A')
+                
                 html_content += f"""
             <div class="finding-card warning">
                 <div class="finding-header">
-                    <span class="finding-title">Session: {finding['session_id'][:36]}...</span>
-                    <span class="risk-badge high">High Risk</span>
+                    <span class="finding-title">Session: {session_id}...</span>
+                    <span class="risk-badge high">High Risk - Rule Detection</span>
                 </div>
                 <div class="finding-body">
                     <table class="data-table">
-                        <tr><td>Users</td><td><strong>{users}</strong></td></tr>
-                        <tr><td>Unique IPs</td><td><strong>{finding['unique_ips']}</strong></td></tr>
-                        <tr><td>Operations</td><td>{finding['operation_count']:,}</td></tr>
-                        <tr><td>KMSI Enabled</td><td>{kmsi_status}</td></tr>
-                        <tr><td>Duration</td><td>{finding['duration_hours']:.2f} hours</td></tr>
-                        <tr><td>First Seen</td><td>{finding['first_seen'][:19].replace('T', ' ')}</td></tr>
-                        <tr><td>Last Seen</td><td>{finding['last_seen'][:19].replace('T', ' ')}</td></tr>
+                        <tr><td>Detection Type</td><td><strong>Session Correlation</strong></td></tr>
+                        <tr><td>Users</td><td><strong>{finding.get('user', 'Unknown')}</strong></td></tr>
+                        <tr><td>Unique IPs</td><td><strong>{unique_ips}</strong></td></tr>
+                        <tr><td>Events</td><td>{event_count}</td></tr>
                         <tr><td>IP Addresses</td><td><div class="ip-list">{ip_tags}</div></td></tr>
                     </table>
                 </div>
             </div>
 """
-        else:
+        
+        if not rule_token_compromise:
             html_content += """
             <div class="empty-state">
                 <div class="empty-icon">&#9989;</div>
@@ -1775,58 +1608,23 @@ class RyoshiDetectionEngine:
 | Total Events Analyzed | {report['total_events_analyzed']:,} |
 | Unique IPs Found | {report.get('unique_ips_found', 0)} |
 | Rules Loaded | {report['rules_loaded']} |
-| Credential Theft Incidents | {report['detections']['credential_theft']} |
-| Token Compromise Incidents | {report['detections']['token_compromise']} |
-| Rule-Based Findings | {report['detections']['rule_based_findings']} |
+| Compromised Users | {len(self.compromised_users)} |
+| Critical Findings | {report['detections']['critical']} |
+| High Findings | {report['detections']['high']} |
 
-## Credential Theft Detections
-
-"""
-        if self.compromises['credential_theft']:
-            for finding in self.compromises['credential_theft']:
-                md_content += f"""
-### {finding['user']}
-
-| Field | Value |
-|-------|-------|
-| Duration | {finding['duration_hours']:.2f} hours |
-| Unique Sessions | {finding['unique_sessions']} |
-| Unique IPs | {finding['unique_ips']} |
-| Login Count | {finding['login_count']} |
-| First Seen | {finding['first_seen']} |
-| Last Seen | {finding['last_seen']} |
-| IP Addresses | {', '.join(finding['ip_addresses'][:10])} |
+## Compromised Users
 
 """
+        if self.compromised_users:
+            for user in sorted(self.compromised_users):
+                md_content += f"- **{user}**\n"
         else:
-            md_content += "No credential theft detected.\n"
+            md_content += "No compromised users detected.\n"
 
-        md_content += "\n## Token Compromise Detections\n\n"
-        
-        if self.compromises['token_compromise']:
-            for finding in self.compromises['token_compromise']:
-                users = ', '.join(finding['users']) if finding['users'] else 'Unknown'
-                md_content += f"""
-### Session: {finding['session_id'][:36]}...
-
-| Field | Value |
-|-------|-------|
-| Users | {users} |
-| Unique IPs | {finding['unique_ips']} |
-| Operations | {finding['operation_count']:,} |
-| KMSI Enabled | {'Yes' if finding['kmsi_enabled'] else 'No'} |
-| Duration | {finding['duration_hours']:.2f} hours |
-| First Seen | {finding['first_seen']} |
-| Last Seen | {finding['last_seen']} |
-
-"""
-        else:
-            md_content += "No token compromise detected.\n"
+        md_content += "\n## Rule Detections\n\n"
 
         if rule_findings:
             md_content += f"""
-## YAML Rule Detections
-
 | Severity | Count |
 |----------|-------|
 | Critical | {critical_count} |
@@ -1838,8 +1636,10 @@ class RyoshiDetectionEngine:
 """
             for rule_id, data in rule_findings.items():
                 md_content += f"- **{data['title']}** ({data['severity']}) - {data['count']} matches\n"
+        else:
+            md_content += "No rule detections.\n"
 
-        md_content += "\n---\n*Ryoshi M365 eDiscovery Detection Engine*\n"
+        md_content += "\n---\n*Ryoshi M365 eDiscovery Detection Engine (Rule-Based)*\n"
 
         md_path = os.path.join(output_dir, 'ryoshi_detection_report.md')
         with open(md_path, 'w', encoding='utf-8') as f:
@@ -1853,20 +1653,17 @@ class RyoshiDetectionEngine:
         print("="*60)
         print(f"Total events analyzed: {len(self.logs)}")
         print(f"Rules loaded: {len(self.rules)}")
-        print(f"\nBuilt-in Detections:")
-        print(f"  Credential theft incidents: {len(self.compromises['credential_theft'])}")
-        print(f"  Token compromise incidents: {len(self.compromises['token_compromise'])}")
+        print(f"Compromised users: {len(self.compromised_users)}")
         
         # Summarize rule-based detections by severity
         critical = sum(1 for d in self.rule_detections.values() if d['severity'] == 'CRITICAL' and d['count'] > 0)
         high = sum(1 for d in self.rule_detections.values() if d['severity'] == 'HIGH' and d['count'] > 0)
         medium = sum(1 for d in self.rule_detections.values() if d['severity'] == 'MEDIUM' and d['count'] > 0)
         
-        if self.rules:
-            print(f"\nYAML Rule Detections (by severity):")
-            print(f"  CRITICAL: {critical}")
-            print(f"  HIGH: {high}")
-            print(f"  MEDIUM: {medium}")
+        print(f"\nRule Detections by Severity:")
+        print(f"  CRITICAL: {critical}")
+        print(f"  HIGH: {high}")
+        print(f"  MEDIUM: {medium}")
         print("="*60)
 
 
@@ -1879,7 +1676,7 @@ Examples:
   %(prog)s -f /path/to/audit_log.csv
   %(prog)s -F /path/to/logs_folder/
   %(prog)s --rules-dir ./rules -f audit.csv
-  %(prog)s -f file1.csv -f file2.csv --no-builtin
+  %(prog)s -f file1.csv -f file2.csv -o /output/dir
         """
     )
     
@@ -1903,12 +1700,6 @@ Examples:
         '--rules-dir',
         default=None,
         help='Path to rules directory (auto-detected by default)'
-    )
-    
-    parser.add_argument(
-        '--no-builtin',
-        action='store_true',
-        help='Disable built-in detections (credential theft, token compromise)'
     )
     
     parser.add_argument(
@@ -1948,20 +1739,12 @@ Examples:
     
     print(f"\n[+] Total events loaded: {len(engine.logs)}")
     
-    # Run built-in detections (unless disabled)
-    if not args.no_builtin:
-        engine.detect_credential_theft()
-        engine.detect_token_compromise()
-    
-    # Run all YAML-based rules dynamically
+    # Run all YAML-based rules
     engine.run_all_rules()
     
-    # Build timelines for compromised users
-    compromised_users = set()
-    for finding in engine.compromises['credential_theft']:
-        compromised_users.add(finding['user'])
-    
-    for user in compromised_users:
+    # Build timelines for compromised users detected by rules
+    print(f"\n[*] Building timelines for {len(engine.compromised_users)} compromised user(s)...")
+    for user in engine.compromised_users:
         engine.build_timeline(user)
     
     engine.generate_report(args.output)
