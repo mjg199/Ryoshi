@@ -140,14 +140,14 @@ Example output:
 [*] Executing 9 YAML rules...
 --------------------------------------------------
 [*] Analyzing 191 sessions for token theft indicators...
-    [*] Session 009988c9-a0c3-08e0-87eb-4... has 21 subnets - checking geolocation...
-    [*] Session 009988c9-9bfd-74ba-74b3-3... has 8 subnets - checking geolocation...
+    [*] Session aaaaaaaa-bbbb-cccc-dddd-e... has 21 subnets - checking geolocation...
+    [*] Session abababab-bcbc-cdcd-dede-e... has 8 subnets - checking geolocation...
 
 [!] Token Compromise - Session Hijacking from Multiple IPs
     Severity: CRITICAL | Sessions Affected: 8
-    - Session 009988c9-a0c3-08e0-8...: 21 IPs, 21 subnets
+    - Session aaaaaaaa-bbbb-cccc-dddd-e...: 21 IPs, 21 subnets
       Countries: NO, ES, SE
-    - Session 009988c9-9bfd-74ba-7...: 11 IPs, 8 subnets
+    - Session abababab-bcbc-cdcd-dede-e...: 11 IPs, 8 subnets
       Countries: ES, FR, SE, IE
       Suspicious IPs (AbuseIPDB): 4
 
@@ -193,8 +193,8 @@ The token hijacking rule uses a **hybrid multi-layer approach**:
 4. **Country Filtering** (Optional): Excludes legitimate locations to reduce false positives
 
 **Example Detection:**
-- User in Spain with sessions from Nigeria, New Zealand, and Europe
-- 17 distinct subnets across 4 countries
+- User in Spain with sessions from other countries/continents
+- Distinct subnets across diverse countries
 - 4 IPs flagged as suspicious by AbuseIPDB
 - Result: **CRITICAL** token theft alert
 
