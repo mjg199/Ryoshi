@@ -17,12 +17,140 @@ import glob
 from datetime import datetime, timedelta
 from collections import defaultdict
 import re
+import socket
+import struct
 
 try:
     import yaml
 except ImportError:
     print("[!] PyYAML not installed. Run: pip install pyyaml")
     yaml = None
+
+try:
+    import requests
+except ImportError:
+    print("[!] requests not installed. Run: pip install requests")
+    requests = None
+
+
+# AbuseIPDB Configuration
+ABUSEIPDB_API_KEY = os.environ.get('ABUSEIPDB_API_KEY', '')  # Set via environment variable
+ABUSEIPDB_CACHE = {}  # Cache to avoid repeated API calls
+
+
+def ip_to_int(ip):
+    """Convert IP address string to integer for subnet calculations"""
+    try:
+        return struct.unpack("!I", socket.inet_aton(ip))[0]
+    except:
+        return 0
+
+
+def get_subnet_24(ip):
+    """Extract /24 subnet from IP address"""
+    try:
+        parts = ip.split('.')
+        if len(parts) == 4:
+            return f"{parts[0]}.{parts[1]}.{parts[2]}.0/24"
+    except:
+        pass
+    return None
+
+
+def get_subnet_16(ip):
+    """Extract /16 subnet from IP address"""
+    try:
+        parts = ip.split('.')
+        if len(parts) == 4:
+            return f"{parts[0]}.{parts[1]}.0.0/16"
+    except:
+        pass
+    return None
+
+
+def check_abuseipdb(ip, api_key=None):
+    """Query AbuseIPDB for IP reputation"""
+    if not requests:
+        return None
+    
+    api_key = api_key or ABUSEIPDB_API_KEY
+    if not api_key:
+        return None
+    
+    # Check cache first
+    if ip in ABUSEIPDB_CACHE:
+        return ABUSEIPDB_CACHE[ip]
+    
+    try:
+        url = 'https://api.abuseipdb.com/api/v2/check'
+        headers = {
+            'Accept': 'application/json',
+            'Key': api_key
+        }
+        params = {
+            'ipAddress': ip,
+            'maxAgeInDays': 90
+        }
+        
+        response = requests.get(url, headers=headers, params=params, timeout=5)
+        if response.status_code == 200:
+            data = response.json().get('data', {})
+            result = {
+                'ip': ip,
+                'abuse_confidence': data.get('abuseConfidenceScore', 0),
+                'country': data.get('countryCode', 'Unknown'),
+                'isp': data.get('isp', 'Unknown'),
+                'domain': data.get('domain', ''),
+                'total_reports': data.get('totalReports', 0),
+                'is_tor': data.get('isTor', False),
+                'is_proxy': data.get('isProxy', False) or data.get('usageType', '').lower() in ['vpn', 'proxy']
+            }
+            ABUSEIPDB_CACHE[ip] = result
+            return result
+    except Exception as e:
+        pass
+    
+    return None
+
+
+def get_ip_geolocation(ip):
+    """Get IP geolocation using free ip-api.com service"""
+    if not requests:
+        return None
+    
+    # Skip private IPs
+    if ip.startswith(('10.', '192.168.', '172.16.', '172.17.', '172.18.', '172.19.',
+                       '172.20.', '172.21.', '172.22.', '172.23.', '172.24.', '172.25.',
+                       '172.26.', '172.27.', '172.28.', '172.29.', '172.30.', '172.31.',
+                       '127.', '169.254.')):
+        return {'country': 'Private', 'countryCode': 'PRIV', 'city': 'Private', 'lat': 0, 'lon': 0}
+    
+    try:
+        response = requests.get(f'http://ip-api.com/json/{ip}?fields=status,country,countryCode,city,lat,lon,isp,org', timeout=3)
+        if response.status_code == 200:
+            data = response.json()
+            if data.get('status') == 'success':
+                return data
+    except:
+        pass
+    
+    return None
+
+
+def calculate_distance_km(lat1, lon1, lat2, lon2):
+    """Calculate distance between two coordinates using Haversine formula"""
+    import math
+    R = 6371  # Earth radius in km
+    
+    lat1_rad = math.radians(lat1)
+    lat2_rad = math.radians(lat2)
+    delta_lat = math.radians(lat2 - lat1)
+    delta_lon = math.radians(lon2 - lon1)
+    
+    a = math.sin(delta_lat/2)**2 + math.cos(lat1_rad) * math.cos(lat2_rad) * math.sin(delta_lon/2)**2
+    c = 2 * math.atan2(math.sqrt(a), math.sqrt(1-a))
+    
+    return R * c
 
 
 def get_default_rules_dir():
@@ -44,12 +172,15 @@ def get_default_rules_dir():
 
 
 class RyoshiDetectionEngine:
-    def __init__(self, rules_dir=None):
+    def __init__(self, rules_dir=None, abuseipdb_key=None):
         self.logs = []
         self.rules = {}
         self.rule_detections = {}  # All detections from YAML rules
         self.timelines = {}
         self.compromised_users = set()  # Users flagged by critical rules
+        self.ip_reputation = {}  # Store IP reputation data for reports
+        self.ip_geolocation = {}  # Store IP geolocation data
+        self.abuseipdb_key = abuseipdb_key or ABUSEIPDB_API_KEY
         
         # Auto-discover rules directory
         if rules_dir is None:
@@ -432,7 +563,11 @@ class RyoshiDetectionEngine:
                 print(f"    - {m['user']}: {m['failed_count']} failures before success")
     
     def _execute_session_rule(self, rule_id, rule):
-        """Execute session correlation rule - detect same session from multiple IPs"""
+        """Execute session correlation rule with hybrid detection:
+        1. Subnet diversity (3+ /24 subnets)
+        2. Geolocation impossible travel
+        3. AbuseIPDB reputation check
+        """
         rule_title = rule.get('title', rule_id)
         severity = rule.get('severity', 'MEDIUM').upper()
         detection = rule.get('detection', {})
@@ -440,9 +575,10 @@ class RyoshiDetectionEngine:
         
         requirements = correlation.get('requirements', {})
         min_ips = self._parse_requirement(requirements.get('unique_ips', '>=2'))
+        min_subnets = self._parse_requirement(requirements.get('unique_subnets', '>=3'))
         
         # Group by session ID
-        session_data = defaultdict(lambda: {'ips': set(), 'users': set(), 'events': []})
+        session_data = defaultdict(lambda: {'ips': set(), 'users': set(), 'events': [], 'subnets_24': set(), 'subnets_16': set()})
         
         for log_entry in self.logs:
             sessions = self.extract_session_ids(log_entry)
@@ -453,6 +589,14 @@ class RyoshiDetectionEngine:
                 if sid:
                     session_data[sid]['ips'].update(ips)
                     session_data[sid]['users'].add(user)
+                    # Track subnets
+                    for ip in ips:
+                        subnet_24 = get_subnet_24(ip)
+                        subnet_16 = get_subnet_16(ip)
+                        if subnet_24:
+                            session_data[sid]['subnets_24'].add(subnet_24)
+                        if subnet_16:
+                            session_data[sid]['subnets_16'].add(subnet_16)
                     session_data[sid]['events'].append({
                         'timestamp': log_entry['timestamp'],
                         'operation': log_entry['operation'],
@@ -460,17 +604,88 @@ class RyoshiDetectionEngine:
                     })
         
         matches = []
+        print(f"\n[*] Analyzing {len(session_data)} sessions for token theft indicators...")
+        
         for session_id, data in session_data.items():
-            if len(data['ips']) >= min_ips:
-                matches.append({
-                    'timestamp': data['events'][0]['timestamp'] if data['events'] else '',
-                    'user': ', '.join(data['users']),
-                    'operation': 'Session Multi-IP',
-                    'ips': list(data['ips']),
-                    'session_id': session_id,
-                    'unique_ips': len(data['ips']),
-                    'event_count': len(data['events'])
-                })
+            # First filter: Minimum IPs
+            if len(data['ips']) < min_ips:
+                continue
+            
+            # Second filter: Subnet diversity (primary detection method)
+            subnet_count = len(data['subnets_24'])
+            if subnet_count < min_subnets:
+                continue
+            
+            # This session has suspicious subnet diversity - enrich with geolocation
+            ip_details = []
+            countries = set()
+            suspicious_ips = []
+            total_abuse_score = 0
+            
+            print(f"    [*] Session {session_id[:25]}... has {subnet_count} subnets - checking geolocation...")
+            
+            for ip in list(data['ips'])[:20]:  # Limit to first 20 IPs for performance
+                ip_info = {'ip': ip, 'country': 'Unknown', 'city': '', 'abuse_score': 0}
+                
+                # Get geolocation
+                geo = get_ip_geolocation(ip)
+                if geo:
+                    ip_info['country'] = geo.get('country', 'Unknown')
+                    ip_info['countryCode'] = geo.get('countryCode', '')
+                    ip_info['city'] = geo.get('city', '')
+                    ip_info['lat'] = geo.get('lat', 0)
+                    ip_info['lon'] = geo.get('lon', 0)
+                    ip_info['isp'] = geo.get('isp', '')
+                    countries.add(geo.get('countryCode', 'Unknown'))
+                    self.ip_geolocation[ip] = geo
+                
+                # Check AbuseIPDB
+                if self.abuseipdb_key:
+                    abuse_data = check_abuseipdb(ip, self.abuseipdb_key)
+                    if abuse_data:
+                        ip_info['abuse_score'] = abuse_data.get('abuse_confidence', 0)
+                        ip_info['is_tor'] = abuse_data.get('is_tor', False)
+                        ip_info['is_proxy'] = abuse_data.get('is_proxy', False)
+                        ip_info['total_reports'] = abuse_data.get('total_reports', 0)
+                        total_abuse_score += ip_info['abuse_score']
+                        self.ip_reputation[ip] = abuse_data
+                        
+                        if ip_info['abuse_score'] > 25 or ip_info['is_tor'] or ip_info['is_proxy']:
+                            suspicious_ips.append(ip)
+                
+                ip_details.append(ip_info)
+            
+            # Calculate risk indicators
+            multi_country = len(countries) > 1
+            high_abuse_score = total_abuse_score / max(len(data['ips']), 1) > 15
+            has_suspicious_ips = len(suspicious_ips) > 0
+            
+            # Determine detection reason
+            detection_reasons = []
+            if subnet_count >= min_subnets:
+                detection_reasons.append(f"{subnet_count} distinct /24 subnets")
+            if multi_country:
+                detection_reasons.append(f"Multi-country access ({', '.join(countries)})")
+            if has_suspicious_ips:
+                detection_reasons.append(f"{len(suspicious_ips)} suspicious IPs (AbuseIPDB)")
+            
+            matches.append({
+                'timestamp': data['events'][0]['timestamp'] if data['events'] else '',
+                'user': ', '.join(data['users']),
+                'operation': 'Token Hijacking Detected',
+                'ips': list(data['ips']),
+                'session_id': session_id,
+                'unique_ips': len(data['ips']),
+                'unique_subnets_24': subnet_count,
+                'unique_subnets_16': len(data['subnets_16']),
+                'event_count': len(data['events']),
+                'countries': list(countries),
+                'multi_country': multi_country,
+                'ip_details': ip_details,
+                'suspicious_ips': suspicious_ips,
+                'avg_abuse_score': total_abuse_score / max(len(ip_details), 1),
+                'detection_reasons': detection_reasons
+            })
         
         self.rule_detections[rule_id]['matches'] = matches[:10]
         self.rule_detections[rule_id]['count'] = len(matches)
@@ -486,8 +701,12 @@ class RyoshiDetectionEngine:
         if matches:
             print(f"\n[!] {rule_title}")
             print(f"    Severity: {severity} | Sessions Affected: {len(matches)}")
-            for m in matches[:2]:
-                print(f"    - Session {m['session_id'][:20]}...: {m['unique_ips']} IPs")
+            for m in matches[:3]:
+                reasons = ', '.join(m.get('detection_reasons', []))
+                print(f"    - Session {m['session_id'][:20]}...: {m['unique_ips']} IPs, {m['unique_subnets_24']} subnets")
+                print(f"      Countries: {', '.join(m.get('countries', []))}")
+                if m.get('suspicious_ips'):
+                    print(f"      Suspicious IPs: {len(m['suspicious_ips'])}")
     
     def _parse_requirement(self, req_str):
         """Parse requirement string like '>=2' into integer"""
@@ -1345,32 +1564,76 @@ class RyoshiDetectionEngine:
             </div>
 """
 
-        # Show rule-based token compromise findings
+        # Show rule-based token compromise findings with enhanced IP reputation data
         if rule_token_compromise:
             for finding in rule_token_compromise:
                 ip_list = finding.get('ips', [])
-                ip_tags = ''.join([f'<span class="ip-tag">{ip}</span>' for ip in ip_list[:8]])
-                if len(ip_list) > 8:
-                    ip_tags += f'<span class="ip-tag">+{len(ip_list) - 8} more</span>'
+                ip_details = finding.get('ip_details', [])
+                countries = finding.get('countries', [])
+                suspicious_ips = finding.get('suspicious_ips', [])
+                detection_reasons = finding.get('detection_reasons', [])
                 
                 session_id = finding.get('session_id', 'Unknown')[:36]
                 unique_ips = finding.get('unique_ips', len(ip_list))
+                unique_subnets = finding.get('unique_subnets_24', 'N/A')
                 event_count = finding.get('event_count', 'N/A')
+                avg_abuse = finding.get('avg_abuse_score', 0)
+                
+                # Build IP table with reputation data
+                ip_table_rows = ''
+                for ip_info in ip_details[:15]:
+                    abuse_class = 'status-yes' if ip_info.get('abuse_score', 0) > 25 else ''
+                    tor_badge = '<span class="risk-badge critical" style="font-size:10px;">TOR</span>' if ip_info.get('is_tor') else ''
+                    proxy_badge = '<span class="risk-badge high" style="font-size:10px;">Proxy</span>' if ip_info.get('is_proxy') else ''
+                    ip_table_rows += f"""
+                        <tr>
+                            <td><code>{ip_info.get('ip', '')}</code></td>
+                            <td>{ip_info.get('country', 'Unknown')}</td>
+                            <td>{ip_info.get('city', '')}</td>
+                            <td class="{abuse_class}">{ip_info.get('abuse_score', 'N/A')}%</td>
+                            <td>{tor_badge} {proxy_badge}</td>
+                        </tr>"""
+                
+                # Determine risk level
+                risk_level = 'critical' if (len(countries) > 2 or avg_abuse > 30 or len(suspicious_ips) > 3) else 'high'
+                risk_text = 'CRITICAL - Multi-Country' if finding.get('multi_country') else 'HIGH - Subnet Diversity'
                 
                 html_content += f"""
-            <div class="finding-card warning">
+            <div class="finding-card {'critical' if risk_level == 'critical' else 'warning'}">
                 <div class="finding-header">
                     <span class="finding-title">Session: {session_id}...</span>
-                    <span class="risk-badge high">High Risk - Rule Detection</span>
+                    <span class="risk-badge {risk_level}">{risk_text}</span>
                 </div>
                 <div class="finding-body">
                     <table class="data-table">
-                        <tr><td>Detection Type</td><td><strong>Session Correlation</strong></td></tr>
+                        <tr><td>Detection Type</td><td><strong>Hybrid Token Theft Detection</strong></td></tr>
                         <tr><td>Users</td><td><strong>{finding.get('user', 'Unknown')}</strong></td></tr>
                         <tr><td>Unique IPs</td><td><strong>{unique_ips}</strong></td></tr>
+                        <tr><td>Unique /24 Subnets</td><td><strong>{unique_subnets}</strong></td></tr>
+                        <tr><td>Countries</td><td><strong>{', '.join(countries) if countries else 'Checking...'}</strong></td></tr>
+                        <tr><td>Suspicious IPs (AbuseIPDB)</td><td class="{'status-yes' if suspicious_ips else ''}">{len(suspicious_ips)}</td></tr>
+                        <tr><td>Avg. Abuse Score</td><td>{avg_abuse:.1f}%</td></tr>
                         <tr><td>Events</td><td>{event_count}</td></tr>
-                        <tr><td>IP Addresses</td><td><div class="ip-list">{ip_tags}</div></td></tr>
+                        <tr><td>Detection Reasons</td><td>{'<br>'.join(detection_reasons)}</td></tr>
                     </table>
+                    
+                    <h4 style="margin: 16px 0 8px 0; color: var(--primary-dark);">IP Reputation Details</h4>
+                    <div style="max-height: 300px; overflow-y: auto;">
+                        <table class="data-table" style="font-size: 12px;">
+                            <thead>
+                                <tr>
+                                    <th>IP Address</th>
+                                    <th>Country</th>
+                                    <th>City</th>
+                                    <th>Abuse Score</th>
+                                    <th>Flags</th>
+                                </tr>
+                            </thead>
+                            <tbody>
+                                {ip_table_rows}
+                            </tbody>
+                        </table>
+                    </div>
                 </div>
             </div>
 """
@@ -1708,6 +1971,12 @@ Examples:
         help='Output directory for reports (default: /tmp)'
     )
     
+    parser.add_argument(
+        '--abuseipdb-key',
+        default=None,
+        help='AbuseIPDB API key for IP reputation checks (can also use ABUSEIPDB_API_KEY env var)'
+    )
+    
     args = parser.parse_args()
     
     if not args.files and not args.folders:
@@ -1716,8 +1985,16 @@ Examples:
     print("[+] Ryoshi M365 eDiscovery Detection Engine (Rule-Based)")
     print("="*60)
     
-    # Initialize engine with rules directory
-    engine = RyoshiDetectionEngine(rules_dir=args.rules_dir)
+    # Check for AbuseIPDB API key
+    abuseipdb_key = args.abuseipdb_key or os.environ.get('ABUSEIPDB_API_KEY', '')
+    if abuseipdb_key:
+        print("[+] AbuseIPDB integration enabled")
+    else:
+        print("[*] AbuseIPDB integration disabled (no API key provided)")
+        print("    Use --abuseipdb-key or set ABUSEIPDB_API_KEY environment variable")
+    
+    # Initialize engine with rules directory and API key
+    engine = RyoshiDetectionEngine(rules_dir=args.rules_dir, abuseipdb_key=abuseipdb_key)
     
     if args.files:
         for filepath in args.files:
