@@ -11,11 +11,15 @@ logsource:
   product: M365
   service: AzureActiveDirectory
 detection:
+  # This rule uses session-based correlation - same session from multiple IPs
+  rule_type: session_correlation
   selection:
     session_id: "*"
-  filter:
-    unique_ips: ">=2"
-  condition: selection and filter | count by session_id > 1 and unique_ips >= 2
+  correlation:
+    by: session_id
+    requirements:
+      unique_ips: ">=2"
+  condition: selection grouped by session_id where unique_ips >= 2
 output_fields:
   - timestamp: CreationDate
   - session_id: SessionId

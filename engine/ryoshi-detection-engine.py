@@ -445,9 +445,21 @@ class RyoshiDetectionEngine:
         
         # Get detection criteria from rule
         detection = rule.get('detection', {})
-        selection = detection.get('selection', {})
+        rule_type = detection.get('rule_type', 'simple')
         
-        # Extract operations to match
+        # Handle different rule types
+        if rule_type == 'correlation':
+            self._execute_correlation_rule(rule_id, rule)
+            return
+        elif rule_type == 'sequence_correlation':
+            self._execute_sequence_rule(rule_id, rule)
+            return
+        elif rule_type == 'session_correlation':
+            self._execute_session_rule(rule_id, rule)
+            return
+        
+        # Simple rule - match operations directly
+        selection = detection.get('selection', {})
         ops_to_match = self._get_operations_from_selection(selection)
         
         # Get threshold and timeframe if specified
@@ -480,6 +492,216 @@ class RyoshiDetectionEngine:
             if matches[:2]:
                 for m in matches[:2]:
                     print(f"    - {m['user']} @ {m['timestamp']}")
+    
+    def _execute_correlation_rule(self, rule_id, rule):
+        """Execute correlation rule - group by user and check session/IP requirements"""
+        rule_title = rule.get('title', rule_id)
+        severity = rule.get('severity', 'MEDIUM').upper()
+        detection = rule.get('detection', {})
+        selection = detection.get('selection', {})
+        filter_criteria = detection.get('filter', {})
+        correlation = detection.get('correlation', {})
+        
+        ops_to_match = self._get_operations_from_selection(selection)
+        required_result = filter_criteria.get('result_status')
+        
+        # Group logins by user
+        user_data = defaultdict(lambda: {'sessions': set(), 'ips': set(), 'events': []})
+        
+        for log_entry in self.logs:
+            if self._matches_selection(log_entry, selection, ops_to_match):
+                # Check result status if required
+                audit = log_entry.get('audit_data', {})
+                if required_result and audit.get('ResultStatus') != required_result:
+                    continue
+                
+                user = log_entry['user_id']
+                ips = self.extract_ip_addresses(log_entry)
+                sessions = self.extract_session_ids(log_entry)
+                
+                user_data[user]['ips'].update(ips)
+                for sid_type, sid in sessions.items():
+                    if sid:
+                        user_data[user]['sessions'].add(sid)
+                user_data[user]['events'].append({
+                    'timestamp': log_entry['timestamp'],
+                    'operation': log_entry['operation'],
+                    'ips': list(ips)
+                })
+        
+        # Check correlation requirements
+        requirements = correlation.get('requirements', {})
+        min_sessions = self._parse_requirement(requirements.get('unique_sessions', '>=1'))
+        min_ips = self._parse_requirement(requirements.get('unique_ips', '>=1'))
+        
+        matches = []
+        for user, data in user_data.items():
+            if len(data['sessions']) >= min_sessions and len(data['ips']) >= min_ips:
+                matches.append({
+                    'timestamp': data['events'][0]['timestamp'] if data['events'] else '',
+                    'user': user,
+                    'operation': 'Correlation Match',
+                    'ips': list(data['ips']),
+                    'unique_sessions': len(data['sessions']),
+                    'unique_ips': len(data['ips']),
+                    'event_count': len(data['events'])
+                })
+        
+        self.rule_detections[rule_id]['matches'] = matches[:10]
+        self.rule_detections[rule_id]['count'] = len(matches)
+        
+        if matches:
+            print(f"\n[!] {rule_title}")
+            print(f"    Severity: {severity} | Users Affected: {len(matches)}")
+            for m in matches[:2]:
+                print(f"    - {m['user']}: {m['unique_sessions']} sessions, {m['unique_ips']} IPs")
+    
+    def _execute_sequence_rule(self, rule_id, rule):
+        """Execute sequence correlation rule - detect patterns like failed then success"""
+        rule_title = rule.get('title', rule_id)
+        severity = rule.get('severity', 'MEDIUM').upper()
+        detection = rule.get('detection', {})
+        
+        selection_failed = detection.get('selection_failed', {})
+        selection_success = detection.get('selection_success', {})
+        filter_success = detection.get('filter_success', {})
+        correlation = detection.get('correlation', {})
+        
+        failed_op = selection_failed.get('operation', 'UserLoginFailed')
+        success_op = selection_success.get('operation', 'UserLoggedIn')
+        required_result = filter_success.get('result_status')
+        
+        # Parse sequence requirements
+        sequence = correlation.get('sequence', [])
+        min_failures = 3  # Default
+        for seq_item in sequence:
+            if isinstance(seq_item, dict) and 'selection_failed' in seq_item:
+                min_failures = self._parse_requirement(seq_item['selection_failed'])
+        
+        # Group events by user
+        user_events = defaultdict(lambda: {'failed': [], 'success': []})
+        
+        for log_entry in self.logs:
+            user = log_entry['user_id']
+            op = log_entry['operation']
+            
+            try:
+                ts = log_entry['timestamp'].replace('Z', '+00:00')
+                if '.' not in ts:
+                    ts = ts.replace('+00:00', '.000000+00:00')
+                timestamp = datetime.fromisoformat(ts.replace('+00:00', ''))
+            except Exception:
+                continue
+            
+            if op == failed_op:
+                user_events[user]['failed'].append({
+                    'timestamp': timestamp,
+                    'ips': list(self.extract_ip_addresses(log_entry)),
+                    'raw_ts': log_entry['timestamp']
+                })
+            elif op == success_op:
+                audit = log_entry.get('audit_data', {})
+                if required_result and audit.get('ResultStatus') != required_result:
+                    continue
+                user_events[user]['success'].append({
+                    'timestamp': timestamp,
+                    'ips': list(self.extract_ip_addresses(log_entry)),
+                    'raw_ts': log_entry['timestamp']
+                })
+        
+        # Check for pattern: multiple failures followed by success within timeframe
+        matches = []
+        for user, events in user_events.items():
+            if len(events['failed']) < min_failures or len(events['success']) == 0:
+                continue
+            
+            # Sort by timestamp
+            events['failed'].sort(key=lambda x: x['timestamp'])
+            events['success'].sort(key=lambda x: x['timestamp'])
+            
+            # Look for sequences: failures followed by success within 1 hour
+            for success in events['success']:
+                # Count failures in the hour before success
+                failures_before = [f for f in events['failed'] 
+                                   if success['timestamp'] - timedelta(hours=1) <= f['timestamp'] < success['timestamp']]
+                
+                if len(failures_before) >= min_failures:
+                    matches.append({
+                        'timestamp': success['raw_ts'],
+                        'user': user,
+                        'operation': 'Failed->Success Sequence',
+                        'ips': success['ips'],
+                        'failed_count': len(failures_before),
+                        'first_failure': failures_before[0]['raw_ts'] if failures_before else '',
+                        'success_time': success['raw_ts']
+                    })
+                    break  # One match per user
+        
+        self.rule_detections[rule_id]['matches'] = matches[:10]
+        self.rule_detections[rule_id]['count'] = len(matches)
+        
+        if matches:
+            print(f"\n[!] {rule_title}")
+            print(f"    Severity: {severity} | Users Affected: {len(matches)}")
+            for m in matches[:2]:
+                print(f"    - {m['user']}: {m['failed_count']} failures before success")
+    
+    def _execute_session_rule(self, rule_id, rule):
+        """Execute session correlation rule - detect same session from multiple IPs"""
+        rule_title = rule.get('title', rule_id)
+        severity = rule.get('severity', 'MEDIUM').upper()
+        detection = rule.get('detection', {})
+        correlation = detection.get('correlation', {})
+        
+        requirements = correlation.get('requirements', {})
+        min_ips = self._parse_requirement(requirements.get('unique_ips', '>=2'))
+        
+        # Group by session ID
+        session_data = defaultdict(lambda: {'ips': set(), 'users': set(), 'events': []})
+        
+        for log_entry in self.logs:
+            sessions = self.extract_session_ids(log_entry)
+            ips = self.extract_ip_addresses(log_entry)
+            user = log_entry['user_id']
+            
+            for sid_type, sid in sessions.items():
+                if sid:
+                    session_data[sid]['ips'].update(ips)
+                    session_data[sid]['users'].add(user)
+                    session_data[sid]['events'].append({
+                        'timestamp': log_entry['timestamp'],
+                        'operation': log_entry['operation'],
+                        'ips': list(ips)
+                    })
+        
+        matches = []
+        for session_id, data in session_data.items():
+            if len(data['ips']) >= min_ips:
+                matches.append({
+                    'timestamp': data['events'][0]['timestamp'] if data['events'] else '',
+                    'user': ', '.join(data['users']),
+                    'operation': 'Session Multi-IP',
+                    'ips': list(data['ips']),
+                    'session_id': session_id,
+                    'unique_ips': len(data['ips']),
+                    'event_count': len(data['events'])
+                })
+        
+        self.rule_detections[rule_id]['matches'] = matches[:10]
+        self.rule_detections[rule_id]['count'] = len(matches)
+        
+        if matches:
+            print(f"\n[!] {rule_title}")
+            print(f"    Severity: {severity} | Sessions Affected: {len(matches)}")
+            for m in matches[:2]:
+                print(f"    - Session {m['session_id'][:20]}...: {m['unique_ips']} IPs")
+    
+    def _parse_requirement(self, req_str):
+        """Parse requirement string like '>=2' into integer"""
+        if isinstance(req_str, int):
+            return req_str
+        match = re.search(r'(\d+)', str(req_str))
+        return int(match.group(1)) if match else 1
     
     def _get_operations_from_selection(self, selection):
         """Extract operation names from selection criteria"""
@@ -609,9 +831,11 @@ class RyoshiDetectionEngine:
         # Generate Markdown report
         self._generate_markdown_report(output_dir, report, rule_findings)
         
-        # Save timelines
+        # Save timelines (JSON and CSV)
         for user, timeline in self.timelines.items():
             safe_user = user.replace('@', '_').replace('.', '_')
+            
+            # Save JSON timeline
             timeline_path = os.path.join(output_dir, f'ryoshi_timeline_{safe_user}.json')
             with open(timeline_path, 'w', encoding='utf-8') as f:
                 json.dump({
@@ -620,6 +844,71 @@ class RyoshiDetectionEngine:
                     'timeline': timeline
                 }, f, indent=2, default=str)
             print(f"[+] Timeline saved: {timeline_path}")
+            
+            # Save CSV timeline
+            self._save_timeline_csv(output_dir, user, safe_user, timeline)
+        
+        # Save combined timeline CSV for all users
+        if self.timelines:
+            self._save_combined_timeline_csv(output_dir)
+    
+    def _save_timeline_csv(self, output_dir, user, safe_user, timeline):
+        """Save individual user timeline as CSV"""
+        csv_path = os.path.join(output_dir, f'ryoshi_timeline_{safe_user}.csv')
+        
+        with open(csv_path, 'w', newline='', encoding='utf-8') as f:
+            writer = csv.writer(f)
+            # Write header
+            writer.writerow(['Timestamp', 'User', 'Operation', 'Workload', 'Result', 'IP Addresses', 'Session IDs'])
+            
+            # Write data rows
+            for event in timeline:
+                ips = '; '.join(event.get('ips', []))
+                sessions = '; '.join([f"{k}:{v}" for k, v in event.get('sessions', {}).items() if v])
+                writer.writerow([
+                    event.get('timestamp', ''),
+                    user,
+                    event.get('operation', ''),
+                    event.get('workload', ''),
+                    event.get('result', ''),
+                    ips,
+                    sessions
+                ])
+        print(f"[+] Timeline CSV saved: {csv_path}")
+    
+    def _save_combined_timeline_csv(self, output_dir):
+        """Save combined timeline for all compromised users as CSV"""
+        csv_path = os.path.join(output_dir, 'ryoshi_combined_timeline.csv')
+        
+        # Combine all timelines
+        all_events = []
+        for user, timeline in self.timelines.items():
+            for event in timeline:
+                all_events.append({
+                    'user': user,
+                    **event
+                })
+        
+        # Sort by timestamp
+        all_events.sort(key=lambda x: x.get('timestamp', ''))
+        
+        with open(csv_path, 'w', newline='', encoding='utf-8') as f:
+            writer = csv.writer(f)
+            writer.writerow(['Timestamp', 'User', 'Operation', 'Workload', 'Result', 'IP Addresses', 'Session IDs'])
+            
+            for event in all_events:
+                ips = '; '.join(event.get('ips', []))
+                sessions = '; '.join([f"{k}:{v}" for k, v in event.get('sessions', {}).items() if v])
+                writer.writerow([
+                    event.get('timestamp', ''),
+                    event.get('user', ''),
+                    event.get('operation', ''),
+                    event.get('workload', ''),
+                    event.get('result', ''),
+                    ips,
+                    sessions
+                ])
+        print(f"[+] Combined timeline CSV saved: {csv_path}")
 
     def _generate_html_report(self, output_dir, report, rule_findings):
         """Generate professional HTML detection report"""
@@ -1004,6 +1293,118 @@ class RyoshiDetectionEngine:
             color: var(--text-secondary);
             margin-top: 2px;
         }}
+        
+        /* Tab Navigation */
+        .tab-nav {{
+            display: flex;
+            gap: 8px;
+            margin-bottom: 24px;
+            border-bottom: 2px solid var(--border-light);
+            padding-bottom: 0;
+        }}
+        
+        .tab-btn {{
+            padding: 12px 24px;
+            background: transparent;
+            border: none;
+            font-size: 14px;
+            font-weight: 600;
+            color: var(--text-secondary);
+            cursor: pointer;
+            border-bottom: 3px solid transparent;
+            margin-bottom: -2px;
+            transition: all 0.2s ease;
+        }}
+        
+        .tab-btn:hover {{
+            color: var(--primary-blue);
+        }}
+        
+        .tab-btn.active {{
+            color: var(--primary-blue);
+            border-bottom-color: var(--primary-blue);
+        }}
+        
+        .tab-content {{
+            display: none;
+        }}
+        
+        .tab-content.active {{
+            display: block;
+        }}
+        
+        /* Timeline Table */
+        .timeline-table {{
+            width: 100%;
+            border-collapse: collapse;
+            font-size: 13px;
+        }}
+        
+        .timeline-table th {{
+            background: var(--primary-blue);
+            color: white;
+            padding: 12px;
+            text-align: left;
+            font-weight: 600;
+            position: sticky;
+            top: 0;
+        }}
+        
+        .timeline-table td {{
+            padding: 10px 12px;
+            border-bottom: 1px solid var(--border-light);
+            vertical-align: top;
+        }}
+        
+        .timeline-table tr:nth-child(even) {{
+            background: #f9fafb;
+        }}
+        
+        .timeline-table tr:hover {{
+            background: #f0f4f8;
+        }}
+        
+        .timeline-user {{
+            font-weight: 600;
+            color: var(--primary-blue);
+        }}
+        
+        .timeline-op {{
+            font-family: 'Consolas', monospace;
+            font-size: 12px;
+            background: #e8f4f8;
+            padding: 2px 6px;
+            border-radius: 4px;
+        }}
+        
+        .timeline-filter {{
+            margin-bottom: 16px;
+            display: flex;
+            gap: 16px;
+            align-items: center;
+        }}
+        
+        .timeline-filter select {{
+            padding: 8px 12px;
+            border: 1px solid var(--border-light);
+            border-radius: 6px;
+            font-size: 14px;
+        }}
+        
+        .timeline-filter input {{
+            padding: 8px 12px;
+            border: 1px solid var(--border-light);
+            border-radius: 6px;
+            font-size: 14px;
+            width: 300px;
+        }}
+        
+        .timeline-scroll {{
+            max-height: 600px;
+            overflow-y: auto;
+            border: 1px solid var(--border-light);
+            border-radius: 8px;
+        }}
     </style>
 </head>
 <body>
@@ -1024,6 +1425,12 @@ class RyoshiDetectionEngine:
     </header>
     
     <main class="container">
+        <nav class="tab-nav">
+            <button class="tab-btn active" onclick="showTab('detections')">&#128202; Detections</button>
+            <button class="tab-btn" onclick="showTab('timeline')">&#128197; Timeline</button>
+        </nav>
+        
+        <div id="detections" class="tab-content active">
         <section class="section">
             <div class="section-header">
                 <div class="section-icon blue">&#128202;</div>
@@ -1187,12 +1594,54 @@ class RyoshiDetectionEngine:
         </section>
 """
 
+        # Close the detections tab div
+        html_content += """
+        </div>
+"""
+
+        # Add Timeline Tab
+        html_content += self._generate_timeline_tab_html()
+
         html_content += """
         <footer class="report-footer">
             <span class="footer-brand">Ryoshi</span> M365 eDiscovery Detection Engine | Enterprise Security Report
             <div style="margin-top: 8px; color: #999;">Confidential - For authorized recipients only</div>
         </footer>
     </main>
+    
+    <script>
+        function showTab(tabId) {{
+            // Hide all tab contents
+            document.querySelectorAll('.tab-content').forEach(function(content) {{
+                content.classList.remove('active');
+            }});
+            // Deactivate all tab buttons
+            document.querySelectorAll('.tab-btn').forEach(function(btn) {{
+                btn.classList.remove('active');
+            }});
+            // Show selected tab content
+            document.getElementById(tabId).classList.add('active');
+            // Activate clicked button
+            event.target.classList.add('active');
+        }}
+        
+        function filterTimeline() {{
+            var userFilter = document.getElementById('userFilter').value.toLowerCase();
+            var opFilter = document.getElementById('opFilter').value.toLowerCase();
+            var rows = document.querySelectorAll('#timelineTable tbody tr');
+            
+            rows.forEach(function(row) {{
+                var user = row.cells[1].textContent.toLowerCase();
+                var op = row.cells[2].textContent.toLowerCase();
+                var showRow = true;
+                
+                if (userFilter && !user.includes(userFilter)) showRow = false;
+                if (opFilter && !op.includes(opFilter)) showRow = false;
+                
+                row.style.display = showRow ? '' : 'none';
+            }});
+        }}
+    </script>
 </body>
 </html>
 """
@@ -1201,6 +1650,112 @@ class RyoshiDetectionEngine:
         with open(html_path, 'w', encoding='utf-8') as f:
             f.write(html_content)
         print(f"[+] HTML report saved: {html_path}")
+
+    def _generate_timeline_tab_html(self):
+        """Generate HTML content for the timeline tab"""
+        # Combine all timelines
+        all_events = []
+        for user, timeline in self.timelines.items():
+            for event in timeline:
+                all_events.append({
+                    'user': user,
+                    **event
+                })
+        
+        # Sort by timestamp
+        all_events.sort(key=lambda x: x.get('timestamp', ''))
+        
+        # Get unique users and operations for filters
+        unique_users = sorted(set(self.timelines.keys()))
+        unique_ops = sorted(set(e.get('operation', '') for e in all_events))
+        
+        # Build user filter options
+        user_options = '<option value="">All Users</option>'
+        for user in unique_users:
+            user_options += f'<option value="{user}">{user}</option>'
+        
+        # Build operation filter options
+        op_options = '<option value="">All Operations</option>'
+        for op in unique_ops[:50]:  # Limit to 50 most common
+            op_options += f'<option value="{op}">{op}</option>'
+        
+        timeline_html = f"""
+        <div id="timeline" class="tab-content">
+            <section class="section">
+                <div class="section-header">
+                    <div class="section-icon blue">&#128197;</div>
+                    <h2 class="section-title">Activity Timeline</h2>
+                    <span class="risk-badge medium">{len(all_events)} Events</span>
+                </div>
+"""
+        
+        if all_events:
+            timeline_html += f"""
+                <div class="timeline-filter">
+                    <label>Filter by User:</label>
+                    <select id="userFilter" onchange="filterTimeline()">
+                        {user_options}
+                    </select>
+                    <label>Filter by Operation:</label>
+                    <input type="text" id="opFilter" placeholder="Type to filter operations..." oninput="filterTimeline()">
+                </div>
+                
+                <div class="timeline-scroll">
+                    <table class="timeline-table" id="timelineTable">
+                        <thead>
+                            <tr>
+                                <th>Timestamp</th>
+                                <th>User</th>
+                                <th>Operation</th>
+                                <th>Workload</th>
+                                <th>Result</th>
+                                <th>IP Addresses</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+"""
+            # Add rows (limit to first 1000 for performance)
+            for event in all_events[:1000]:
+                ips = ', '.join(event.get('ips', [])) or '-'
+                timestamp = event.get('timestamp', '')[:19].replace('T', ' ')
+                result = event.get('result', '') or '-'
+                workload = event.get('workload', '') or '-'
+                
+                timeline_html += f"""
+                            <tr>
+                                <td>{timestamp}</td>
+                                <td class="timeline-user">{event.get('user', '')}</td>
+                                <td><span class="timeline-op">{event.get('operation', '')}</span></td>
+                                <td>{workload}</td>
+                                <td>{result}</td>
+                                <td>{ips}</td>
+                            </tr>
+"""
+            
+            timeline_html += """
+                        </tbody>
+                    </table>
+                </div>
+"""
+            if len(all_events) > 1000:
+                timeline_html += f"""
+                <div style="margin-top: 16px; padding: 12px; background: #fff3cd; border-radius: 8px; color: #856404;">
+                    <strong>Note:</strong> Showing first 1,000 of {len(all_events):,} events. Download CSV for complete timeline.
+                </div>
+"""
+        else:
+            timeline_html += """
+                <div class="empty-state">
+                    <div class="empty-icon">&#128197;</div>
+                    <div class="empty-text">No timeline data available. Timelines are generated for compromised users.</div>
+                </div>
+"""
+        
+        timeline_html += """
+            </section>
+        </div>
+"""
+        return timeline_html
 
     def _generate_markdown_report(self, output_dir, report, rule_findings):
         """Generate Markdown detection report"""
