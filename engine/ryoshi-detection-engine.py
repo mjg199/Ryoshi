@@ -17,12 +17,150 @@ import glob
 from datetime import datetime, timedelta
 from collections import defaultdict
 import re
+import socket
+import struct
 
 try:
     import yaml
 except ImportError:
     print("[!] PyYAML not installed. Run: pip install pyyaml")
     yaml = None
+
+try:
+    import requests
+except ImportError:
+    print("[!] requests not installed. Run: pip install requests")
+    requests = None
+
+
+# AbuseIPDB Configuration
+ABUSEIPDB_API_KEY = os.environ.get('ABUSEIPDB_API_KEY', '')  # Set via environment variable
+ABUSEIPDB_CACHE = {}  # Cache to avoid repeated API calls
+
+
+def ip_to_int(ip):
+    """Convert IP address string to integer for subnet calculations"""
+    try:
+        return struct.unpack("!I", socket.inet_aton(ip))[0]
+    except:
+        return 0
+
+
+def get_subnet_24(ip):
+    """Extract /24 subnet from IP address"""
+    try:
+        parts = ip.split('.')
+        if len(parts) == 4:
+            return f"{parts[0]}.{parts[1]}.{parts[2]}.0/24"
+    except:
+        pass
+    return None
+
+
+def get_subnet_16(ip):
+    """Extract /16 subnet from IP address"""
+    try:
+        parts = ip.split('.')
+        if len(parts) == 4:
+            return f"{parts[0]}.{parts[1]}.0.0/16"
+    except:
+        pass
+    return None
+
+
+def check_abuseipdb(ip, api_key=None):
+    """Query AbuseIPDB for IP reputation"""
+    if not requests:
+        return None
+    
+    api_key = api_key or ABUSEIPDB_API_KEY
+    if not api_key:
+        return None
+    
+    # Check cache first
+    if ip in ABUSEIPDB_CACHE:
+        return ABUSEIPDB_CACHE[ip]
+    
+    try:
+        url = 'https://api.abuseipdb.com/api/v2/check'
+        headers = {
+            'Accept': 'application/json',
+            'Key': api_key
+        }
+        params = {
+            'ipAddress': ip,
+            'maxAgeInDays': 90
+        }
+        
+        response = requests.get(url, headers=headers, params=params, timeout=10, verify=True)
+        if response.status_code == 200:
+            data = response.json().get('data', {})
+            result = {
+                'ip': ip,
+                'abuse_confidence': data.get('abuseConfidenceScore', 0),
+                'country': data.get('countryCode', 'Unknown'),
+                'isp': data.get('isp', 'Unknown'),
+                'domain': data.get('domain', ''),
+                'total_reports': data.get('totalReports', 0),
+                'is_tor': data.get('isTor', False),
+                'is_proxy': data.get('isProxy', False) or data.get('usageType', '').lower() in ['vpn', 'proxy']
+            }
+            ABUSEIPDB_CACHE[ip] = result
+            return result
+        elif response.status_code == 401:
+            print(f"    [!] AbuseIPDB: Invalid API key")
+            return None
+        elif response.status_code == 429:
+            print(f"    [!] AbuseIPDB: Rate limit exceeded")
+            return None
+    except requests.exceptions.SSLError as e:
+        print(f"    [!] AbuseIPDB SSL error for {ip}: {str(e)[:50]}")
+    except requests.exceptions.Timeout:
+        print(f"    [!] AbuseIPDB timeout for {ip}")
+    except Exception as e:
+        print(f"    [!] AbuseIPDB error for {ip}: {str(e)[:50]}")
+    
+    return None
+
+
+def get_ip_geolocation(ip):
+    """Get IP geolocation using free ip-api.com service"""
+    if not requests:
+        return None
+    
+    # Skip private IPs
+    if ip.startswith(('10.', '192.168.', '172.16.', '172.17.', '172.18.', '172.19.',
+                       '172.20.', '172.21.', '172.22.', '172.23.', '172.24.', '172.25.',
+                       '172.26.', '172.27.', '172.28.', '172.29.', '172.30.', '172.31.',
+                       '127.', '169.254.')):
+        return {'country': 'Private', 'countryCode': 'PRIV', 'city': 'Private', 'lat': 0, 'lon': 0}
+    
+    try:
+        response = requests.get(f'http://ip-api.com/json/{ip}?fields=status,country,countryCode,city,lat,lon,isp,org', timeout=3)
+        if response.status_code == 200:
+            data = response.json()
+            if data.get('status') == 'success':
+                return data
+    except:
+        pass
+    
+    return None
+
+
+def calculate_distance_km(lat1, lon1, lat2, lon2):
+    """Calculate distance between two coordinates using Haversine formula"""
+    import math
+    R = 6371  # Earth radius in km
+    
+    lat1_rad = math.radians(lat1)
+    lat2_rad = math.radians(lat2)
+    delta_lat = math.radians(lat2 - lat1)
+    delta_lon = math.radians(lon2 - lon1)
+    
+    a = math.sin(delta_lat/2)**2 + math.cos(lat1_rad) * math.cos(lat2_rad) * math.sin(delta_lon/2)**2
+    c = 2 * math.atan2(math.sqrt(a), math.sqrt(1-a))
+    
+    return R * c
 
 
 def get_default_rules_dir():
@@ -44,15 +182,38 @@ def get_default_rules_dir():
 
 
 class RyoshiDetectionEngine:
-    def __init__(self, rules_dir=None):
+    def __init__(self, rules_dir=None, abuseipdb_key=None, exclude_countries=None):
         self.logs = []
         self.rules = {}
-        self.compromises = {
-            'credential_theft': [],
-            'token_compromise': []
-        }
-        self.rule_detections = {}  # Detections from dynamic rules
+        self.rule_detections = {}  # All detections from YAML rules
         self.timelines = {}
+        self.compromised_users = set()  # Users flagged by critical rules
+        self.ip_reputation = {}  # Store IP reputation data for reports
+        self.ip_geolocation = {}  # Store IP geolocation data
+        self.abuseipdb_key = abuseipdb_key or ABUSEIPDB_API_KEY
+        # Normalize excluded countries to lowercase for comparison
+        self.exclude_countries = set()
+        if exclude_countries:
+            for c in exclude_countries:
+                self.exclude_countries.add(c.lower())
+                # Also add common country code mappings
+                country_codes = {
+                    'spain': 'ES', 'es': 'ES',
+                    'united states': 'US', 'usa': 'US', 'us': 'US',
+                    'united kingdom': 'GB', 'uk': 'GB', 'gb': 'GB',
+                    'germany': 'DE', 'de': 'DE',
+                    'france': 'FR', 'fr': 'FR',
+                    'italy': 'IT', 'it': 'IT',
+                    'portugal': 'PT', 'pt': 'PT',
+                    'netherlands': 'NL', 'nl': 'NL',
+                    'belgium': 'BE', 'be': 'BE',
+                    'norway': 'NO', 'no': 'NO',
+                    'sweden': 'SE', 'se': 'SE',
+                    'ireland': 'IE', 'ie': 'IE',
+                    'nigeria': 'NG', 'ng': 'NG',
+                }
+                if c.lower() in country_codes:
+                    self.exclude_countries.add(country_codes[c.lower()].lower())
         
         # Auto-discover rules directory
         if rules_dir is None:
@@ -191,232 +352,6 @@ class RyoshiDetectionEngine:
                             return True
         return False
 
-    def detect_credential_theft(self, threshold_hours=24):
-        """Detect credential theft: multiple sessions from diverse IPs"""
-        print(f"\n[*] Detecting credential theft (timeframe: {threshold_hours}h)...")
-        
-        user_logins = defaultdict(list)
-        
-        for log_entry in self.logs:
-            if log_entry['operation'] == 'UserLoggedIn':
-                audit = log_entry.get('audit_data', {})
-                if audit.get('ResultStatus') == 'Success':
-                    user = log_entry['user_id']
-                    ips = self.extract_ip_addresses(log_entry)
-                    sessions = self.extract_session_ids(log_entry)
-                    
-                    try:
-                        ts = log_entry['timestamp'].replace('Z', '+00:00')
-                        if '.' not in ts:
-                            ts = ts.replace('+00:00', '.000000+00:00')
-                        timestamp = datetime.fromisoformat(ts.replace('+00:00', ''))
-                    except Exception:
-                        continue
-                    
-                    user_logins[user].append({
-                        'timestamp': timestamp,
-                        'ips': ips,
-                        'sessions': sessions,
-                        'kmsi': self.check_kmsi_enabled(log_entry),
-                        'raw': log_entry
-                    })
-        
-        for user, logins in user_logins.items():
-            if len(logins) < 2:
-                continue
-            
-            logins.sort(key=lambda x: x['timestamp'])
-            
-            unique_sessions = set()
-            unique_ips = set()
-            
-            for login in logins:
-                for sid_type, sid in login['sessions'].items():
-                    if sid:
-                        unique_sessions.add(sid)
-                unique_ips.update(login['ips'])
-            
-            if len(unique_sessions) >= 2 and len(unique_ips) >= 2:
-                time_range = logins[-1]['timestamp'] - logins[0]['timestamp']
-                
-                self.compromises['credential_theft'].append({
-                    'user': user,
-                    'unique_sessions': len(unique_sessions),
-                    'unique_ips': len(unique_ips),
-                    'session_ids': list(unique_sessions),
-                    'ip_addresses': list(unique_ips),
-                    'first_seen': logins[0]['timestamp'].isoformat(),
-                    'last_seen': logins[-1]['timestamp'].isoformat(),
-                    'duration_hours': time_range.total_seconds() / 3600,
-                    'login_count': len(logins)
-                })
-                print(f"[!] CREDENTIAL THEFT DETECTED: {user}")
-                print(f"    Sessions: {len(unique_sessions)}, IPs: {len(unique_ips)}")
-
-    def detect_token_compromise(self, threshold_hours=168):
-        """Detect token compromise: single session from multiple IPs"""
-        print(f"\n[*] Detecting token compromise (timeframe: {threshold_hours}h)...")
-        
-        session_usage = defaultdict(lambda: {
-            'ips': set(),
-            'users': set(),
-            'operations': [],
-            'kmsi': False,
-            'first_seen': None,
-            'last_seen': None
-        })
-        
-        for log_entry in self.logs:
-            sessions = self.extract_session_ids(log_entry)
-            ips = self.extract_ip_addresses(log_entry)
-            user = log_entry['user_id']
-            
-            try:
-                ts = log_entry['timestamp'].replace('Z', '+00:00')
-                if '.' not in ts:
-                    ts = ts.replace('+00:00', '.000000+00:00')
-                timestamp = datetime.fromisoformat(ts.replace('+00:00', ''))
-            except Exception:
-                continue
-            
-            for sid_type, sid in sessions.items():
-                if sid:
-                    session_usage[sid]['ips'].update(ips)
-                    session_usage[sid]['users'].add(user)
-                    session_usage[sid]['operations'].append({
-                        'operation': log_entry['operation'],
-                        'timestamp': timestamp
-                    })
-                    
-                    if self.check_kmsi_enabled(log_entry):
-                        session_usage[sid]['kmsi'] = True
-                    
-                    if session_usage[sid]['first_seen'] is None:
-                        session_usage[sid]['first_seen'] = timestamp
-                    session_usage[sid]['last_seen'] = timestamp
-        
-        for session_id, data in session_usage.items():
-            if len(data['ips']) >= 2:
-                duration = (data['last_seen'] - data['first_seen']).total_seconds() / 3600
-                
-                self.compromises['token_compromise'].append({
-                    'session_id': session_id,
-                    'users': list(data['users']),
-                    'unique_ips': len(data['ips']),
-                    'ip_addresses': list(data['ips']),
-                    'operation_count': len(data['operations']),
-                    'kmsi_enabled': data['kmsi'],
-                    'first_seen': data['first_seen'].isoformat(),
-                    'last_seen': data['last_seen'].isoformat(),
-                    'duration_hours': duration
-                })
-                
-                user_str = ', '.join(data['users'])
-                print(f"[!] TOKEN COMPROMISE DETECTED: {session_id[:36]}...")
-                print(f"    User: {user_str}, IPs: {len(data['ips'])}, KMSI: {data['kmsi']}")
-
-    def detect_bulk_email_access(self, threshold=500, timeframe_hours=1):
-        """Detect bulk email access - potential data exfiltration"""
-        print(f"\n[*] Detecting bulk email access ({threshold}+ in {timeframe_hours}h)...")
-        
-        session_email_access = defaultdict(list)
-        
-        for log_entry in self.logs:
-            if log_entry['operation'] == 'MailItemsAccessed':
-                sessions = self.extract_session_ids(log_entry)
-                
-                try:
-                    ts = log_entry['timestamp'].replace('Z', '+00:00')
-                    if '.' not in ts:
-                        ts = ts.replace('+00:00', '.000000+00:00')
-                    timestamp = datetime.fromisoformat(ts.replace('+00:00', ''))
-                except Exception:
-                    continue
-                
-                for sid_type, sid in sessions.items():
-                    if sid:
-                        session_email_access[sid].append(timestamp)
-        
-        for session_id, timestamps in session_email_access.items():
-            if len(timestamps) >= threshold:
-                print(f"[!] BULK EMAIL ACCESS DETECTED: {session_id[:36]}...")
-                print(f"    Emails Accessed: {len(timestamps)}")
-
-    def detect_sendas_operations(self):
-        """Detect SendAs operations - potential BEC attacks"""
-        print(f"\n[*] Detecting SendAs/Impersonation operations...")
-        
-        sendas_count = 0
-        for log_entry in self.logs:
-            if log_entry['operation'] in ['SendAs', 'SendOnBehalf']:
-                sendas_count += 1
-                if sendas_count <= 5:  # Print first 5
-                    print(f"[!] SENDAS DETECTED: {log_entry['user_id']} - {log_entry['timestamp']}")
-        
-        if sendas_count > 0:
-            print(f"[+] Total SendAs operations found: {sendas_count}")
-
-    def detect_email_deletions(self):
-        """Detect email deletion patterns"""
-        print(f"\n[*] Detecting email deletions (SoftDelete, HardDelete, MoveToDeletedItems)...")
-        
-        deletion_ops = ['SoftDelete', 'HardDelete', 'MoveToDeletedItems']
-        deletion_count = 0
-        
-        for log_entry in self.logs:
-            if log_entry['operation'] in deletion_ops:
-                deletion_count += 1
-        
-        print(f"[+] Total deletion operations found: {deletion_count}")
-
-    def detect_inbox_rules(self):
-        """Detect inbox rule creation"""
-        print(f"\n[*] Detecting inbox rule operations...")
-        
-        rule_ops = ['New-InboxRule', 'Set-InboxRule', 'Enable-InboxRule']
-        rule_count = 0
-        
-        for log_entry in self.logs:
-            if log_entry['operation'] in rule_ops:
-                rule_count += 1
-                if rule_count <= 3:  # Print first 3
-                    print(f"[!] INBOX RULE: {log_entry['user_id']} - {log_entry['operation']}")
-        
-        if rule_count > 0:
-            print(f"[+] Total inbox rule operations: {rule_count}")
-
-    def detect_failed_logins(self):
-        """Detect failed login patterns"""
-        print(f"\n[*] Detecting failed login attempts...")
-        
-        failed_count = 0
-        for log_entry in self.logs:
-            if log_entry['operation'] == 'UserLoginFailed':
-                failed_count += 1
-        
-        if failed_count > 0:
-            print(f"[+] Total failed login attempts: {failed_count}")
-
-    def detect_file_downloads(self, threshold=50, timeframe_hours=1):
-        """Detect mass file downloads"""
-        print(f"\n[*] Detecting mass file downloads ({threshold}+ in {timeframe_hours}h)...")
-        
-        download_ops = ['FileDownloaded', 'FileSyncDownloadedFull']
-        session_downloads = defaultdict(int)
-        
-        for log_entry in self.logs:
-            if log_entry['operation'] in download_ops:
-                sessions = self.extract_session_ids(log_entry)
-                for sid_type, sid in sessions.items():
-                    if sid:
-                        session_downloads[sid] += 1
-        
-        high_downloads = [s for s, c in session_downloads.items() if c >= threshold]
-        if high_downloads:
-            print(f"[!] MASS FILE DOWNLOAD DETECTED: {len(high_downloads)} sessions")
-            for sid in high_downloads[:3]:
-                print(f"    Session {sid[:36]}... : {session_downloads[sid]} downloads")
-
     def run_all_rules(self):
         """Execute all loaded YAML rules against the logs"""
         if not self.rules:
@@ -445,9 +380,21 @@ class RyoshiDetectionEngine:
         
         # Get detection criteria from rule
         detection = rule.get('detection', {})
-        selection = detection.get('selection', {})
+        rule_type = detection.get('rule_type', 'simple')
         
-        # Extract operations to match
+        # Handle different rule types
+        if rule_type == 'correlation':
+            self._execute_correlation_rule(rule_id, rule)
+            return
+        elif rule_type == 'sequence_correlation':
+            self._execute_sequence_rule(rule_id, rule)
+            return
+        elif rule_type == 'session_correlation':
+            self._execute_session_rule(rule_id, rule)
+            return
+        
+        # Simple rule - match operations directly
+        selection = detection.get('selection', {})
         ops_to_match = self._get_operations_from_selection(selection)
         
         # Get threshold and timeframe if specified
@@ -480,6 +427,356 @@ class RyoshiDetectionEngine:
             if matches[:2]:
                 for m in matches[:2]:
                     print(f"    - {m['user']} @ {m['timestamp']}")
+    
+    def _execute_correlation_rule(self, rule_id, rule):
+        """Execute correlation rule - group by user and check session/IP requirements"""
+        rule_title = rule.get('title', rule_id)
+        severity = rule.get('severity', 'MEDIUM').upper()
+        detection = rule.get('detection', {})
+        selection = detection.get('selection', {})
+        filter_criteria = detection.get('filter', {})
+        correlation = detection.get('correlation', {})
+        
+        ops_to_match = self._get_operations_from_selection(selection)
+        required_result = filter_criteria.get('result_status')
+        
+        # Group logins by user
+        user_data = defaultdict(lambda: {'sessions': set(), 'ips': set(), 'events': []})
+        
+        for log_entry in self.logs:
+            if self._matches_selection(log_entry, selection, ops_to_match):
+                # Check result status if required
+                audit = log_entry.get('audit_data', {})
+                if required_result and audit.get('ResultStatus') != required_result:
+                    continue
+                
+                user = log_entry['user_id']
+                ips = self.extract_ip_addresses(log_entry)
+                sessions = self.extract_session_ids(log_entry)
+                
+                user_data[user]['ips'].update(ips)
+                for sid_type, sid in sessions.items():
+                    if sid:
+                        user_data[user]['sessions'].add(sid)
+                user_data[user]['events'].append({
+                    'timestamp': log_entry['timestamp'],
+                    'operation': log_entry['operation'],
+                    'ips': list(ips)
+                })
+        
+        # Check correlation requirements
+        requirements = correlation.get('requirements', {})
+        min_sessions = self._parse_requirement(requirements.get('unique_sessions', '>=1'))
+        min_ips = self._parse_requirement(requirements.get('unique_ips', '>=1'))
+        
+        matches = []
+        for user, data in user_data.items():
+            if len(data['sessions']) >= min_sessions and len(data['ips']) >= min_ips:
+                matches.append({
+                    'timestamp': data['events'][0]['timestamp'] if data['events'] else '',
+                    'user': user,
+                    'operation': 'Correlation Match',
+                    'ips': list(data['ips']),
+                    'unique_sessions': len(data['sessions']),
+                    'unique_ips': len(data['ips']),
+                    'event_count': len(data['events'])
+                })
+        
+        self.rule_detections[rule_id]['matches'] = matches[:10]
+        self.rule_detections[rule_id]['count'] = len(matches)
+        
+        # Track compromised users for timeline generation (CRITICAL severity only)
+        if matches and severity == 'CRITICAL':
+            for m in matches:
+                user = m.get('user', '')
+                if user and ',' not in user:  # Single user
+                    self.compromised_users.add(user)
+        
+        if matches:
+            print(f"\n[!] {rule_title}")
+            print(f"    Severity: {severity} | Users Affected: {len(matches)}")
+            for m in matches[:2]:
+                print(f"    - {m['user']}: {m['unique_sessions']} sessions, {m['unique_ips']} IPs")
+    
+    def _execute_sequence_rule(self, rule_id, rule):
+        """Execute sequence correlation rule - detect patterns like failed then success"""
+        rule_title = rule.get('title', rule_id)
+        severity = rule.get('severity', 'MEDIUM').upper()
+        detection = rule.get('detection', {})
+        
+        selection_failed = detection.get('selection_failed', {})
+        selection_success = detection.get('selection_success', {})
+        filter_success = detection.get('filter_success', {})
+        correlation = detection.get('correlation', {})
+        
+        failed_op = selection_failed.get('operation', 'UserLoginFailed')
+        success_op = selection_success.get('operation', 'UserLoggedIn')
+        required_result = filter_success.get('result_status')
+        
+        # Parse sequence requirements
+        sequence = correlation.get('sequence', [])
+        min_failures = 3  # Default
+        for seq_item in sequence:
+            if isinstance(seq_item, dict) and 'selection_failed' in seq_item:
+                min_failures = self._parse_requirement(seq_item['selection_failed'])
+        
+        # Group events by user
+        user_events = defaultdict(lambda: {'failed': [], 'success': []})
+        
+        for log_entry in self.logs:
+            user = log_entry['user_id']
+            op = log_entry['operation']
+            
+            try:
+                ts = log_entry['timestamp'].replace('Z', '+00:00')
+                if '.' not in ts:
+                    ts = ts.replace('+00:00', '.000000+00:00')
+                timestamp = datetime.fromisoformat(ts.replace('+00:00', ''))
+            except Exception:
+                continue
+            
+            if op == failed_op:
+                user_events[user]['failed'].append({
+                    'timestamp': timestamp,
+                    'ips': list(self.extract_ip_addresses(log_entry)),
+                    'raw_ts': log_entry['timestamp']
+                })
+            elif op == success_op:
+                audit = log_entry.get('audit_data', {})
+                if required_result and audit.get('ResultStatus') != required_result:
+                    continue
+                user_events[user]['success'].append({
+                    'timestamp': timestamp,
+                    'ips': list(self.extract_ip_addresses(log_entry)),
+                    'raw_ts': log_entry['timestamp']
+                })
+        
+        # Check for pattern: multiple failures followed by success within timeframe
+        matches = []
+        for user, events in user_events.items():
+            if len(events['failed']) < min_failures or len(events['success']) == 0:
+                continue
+            
+            # Sort by timestamp
+            events['failed'].sort(key=lambda x: x['timestamp'])
+            events['success'].sort(key=lambda x: x['timestamp'])
+            
+            # Look for sequences: failures followed by success within 1 hour
+            for success in events['success']:
+                # Count failures in the hour before success
+                failures_before = [f for f in events['failed'] 
+                                   if success['timestamp'] - timedelta(hours=1) <= f['timestamp'] < success['timestamp']]
+                
+                if len(failures_before) >= min_failures:
+                    matches.append({
+                        'timestamp': success['raw_ts'],
+                        'user': user,
+                        'operation': 'Failed->Success Sequence',
+                        'ips': success['ips'],
+                        'failed_count': len(failures_before),
+                        'first_failure': failures_before[0]['raw_ts'] if failures_before else '',
+                        'success_time': success['raw_ts']
+                    })
+                    break  # One match per user
+        
+        self.rule_detections[rule_id]['matches'] = matches[:10]
+        self.rule_detections[rule_id]['count'] = len(matches)
+        
+        # Track compromised users for timeline generation (HIGH+ severity)
+        if matches and severity in ['CRITICAL', 'HIGH']:
+            for m in matches:
+                user = m.get('user', '')
+                if user:
+                    self.compromised_users.add(user)
+        
+        if matches:
+            print(f"\n[!] {rule_title}")
+            print(f"    Severity: {severity} | Users Affected: {len(matches)}")
+            for m in matches[:2]:
+                print(f"    - {m['user']}: {m['failed_count']} failures before success")
+    
+    def _execute_session_rule(self, rule_id, rule):
+        """Execute session correlation rule with hybrid detection:
+        1. Subnet diversity (3+ /24 subnets)
+        2. Geolocation impossible travel
+        3. AbuseIPDB reputation check
+        """
+        rule_title = rule.get('title', rule_id)
+        severity = rule.get('severity', 'MEDIUM').upper()
+        detection = rule.get('detection', {})
+        correlation = detection.get('correlation', {})
+        
+        requirements = correlation.get('requirements', {})
+        min_ips = self._parse_requirement(requirements.get('unique_ips', '>=2'))
+        min_subnets = self._parse_requirement(requirements.get('unique_subnets', '>=3'))
+        
+        # Group by session ID
+        session_data = defaultdict(lambda: {'ips': set(), 'users': set(), 'events': [], 'subnets_24': set(), 'subnets_16': set()})
+        
+        for log_entry in self.logs:
+            sessions = self.extract_session_ids(log_entry)
+            ips = self.extract_ip_addresses(log_entry)
+            user = log_entry['user_id']
+            
+            for sid_type, sid in sessions.items():
+                if sid:
+                    session_data[sid]['ips'].update(ips)
+                    session_data[sid]['users'].add(user)
+                    # Track subnets
+                    for ip in ips:
+                        subnet_24 = get_subnet_24(ip)
+                        subnet_16 = get_subnet_16(ip)
+                        if subnet_24:
+                            session_data[sid]['subnets_24'].add(subnet_24)
+                        if subnet_16:
+                            session_data[sid]['subnets_16'].add(subnet_16)
+                    session_data[sid]['events'].append({
+                        'timestamp': log_entry['timestamp'],
+                        'operation': log_entry['operation'],
+                        'ips': list(ips)
+                    })
+        
+        matches = []
+        print(f"\n[*] Analyzing {len(session_data)} sessions for token theft indicators...")
+        
+        for session_id, data in session_data.items():
+            # First filter: Minimum IPs
+            if len(data['ips']) < min_ips:
+                continue
+            
+            # Second filter: Subnet diversity (primary detection method)
+            subnet_count = len(data['subnets_24'])
+            if subnet_count < min_subnets:
+                continue
+            
+            # This session has suspicious subnet diversity - enrich with geolocation
+            ip_details = []
+            countries = set()
+            suspicious_ips = []
+            excluded_ips = []  # IPs from excluded countries
+            total_abuse_score = 0
+            
+            print(f"    [*] Session {session_id[:25]}... has {subnet_count} subnets - checking geolocation...")
+            
+            for ip in list(data['ips'])[:20]:  # Limit to first 20 IPs for performance
+                ip_info = {'ip': ip, 'country': 'Unknown', 'city': '', 'abuse_score': 0, 'excluded': False}
+                
+                # Get geolocation
+                geo = get_ip_geolocation(ip)
+                if geo:
+                    ip_info['country'] = geo.get('country', 'Unknown')
+                    ip_info['countryCode'] = geo.get('countryCode', '')
+                    ip_info['city'] = geo.get('city', '')
+                    ip_info['lat'] = geo.get('lat', 0)
+                    ip_info['lon'] = geo.get('lon', 0)
+                    ip_info['isp'] = geo.get('isp', '')
+                    
+                    # Check if this country should be excluded
+                    country_code = geo.get('countryCode', '').lower()
+                    country_name = geo.get('country', '').lower()
+                    if country_code in self.exclude_countries or country_name in self.exclude_countries:
+                        ip_info['excluded'] = True
+                        excluded_ips.append(ip)
+                    else:
+                        countries.add(geo.get('countryCode', 'Unknown'))
+                    
+                    self.ip_geolocation[ip] = geo
+                
+                # Check AbuseIPDB
+                if self.abuseipdb_key:
+                    abuse_data = check_abuseipdb(ip, self.abuseipdb_key)
+                    if abuse_data:
+                        ip_info['abuse_score'] = abuse_data.get('abuse_confidence', 0)
+                        ip_info['is_tor'] = abuse_data.get('is_tor', False)
+                        ip_info['is_proxy'] = abuse_data.get('is_proxy', False)
+                        ip_info['total_reports'] = abuse_data.get('total_reports', 0)
+                        total_abuse_score += ip_info['abuse_score']
+                        self.ip_reputation[ip] = abuse_data
+                        
+                        if ip_info['abuse_score'] > 25 or ip_info['is_tor'] or ip_info['is_proxy']:
+                            suspicious_ips.append(ip)
+                
+                ip_details.append(ip_info)
+            
+            # Filter: If all IPs are from excluded countries, skip this session
+            non_excluded_ips = [ip for ip in ip_details if not ip.get('excluded', False)]
+            if len(non_excluded_ips) == 0:
+                print(f"        [~] Skipped - all IPs from excluded countries ({', '.join(set(self.exclude_countries))})")
+                continue
+            
+            # Recalculate subnet count excluding excluded country IPs
+            non_excluded_subnets = set()
+            for ip_info in non_excluded_ips:
+                subnet = get_subnet_24(ip_info['ip'])
+                if subnet:
+                    non_excluded_subnets.add(subnet)
+            
+            # If filtered subnets don't meet threshold, skip
+            if len(non_excluded_subnets) < min_subnets:
+                print(f"        [~] Skipped - only {len(non_excluded_subnets)} subnets after excluding {len(excluded_ips)} IPs from {', '.join(set(self.exclude_countries))}")
+                continue
+            
+            # Calculate risk indicators
+            multi_country = len(countries) > 1
+            high_abuse_score = total_abuse_score / max(len(data['ips']), 1) > 15
+            has_suspicious_ips = len(suspicious_ips) > 0
+            
+            # Determine detection reason
+            detection_reasons = []
+            if len(non_excluded_subnets) >= min_subnets:
+                detection_reasons.append(f"{len(non_excluded_subnets)} distinct /24 subnets (excl. {len(excluded_ips)} IPs from allowed countries)")
+            if multi_country:
+                detection_reasons.append(f"Multi-country access ({', '.join(countries)})")
+            if has_suspicious_ips:
+                detection_reasons.append(f"{len(suspicious_ips)} suspicious IPs (AbuseIPDB)")
+            
+            matches.append({
+                'timestamp': data['events'][0]['timestamp'] if data['events'] else '',
+                'user': ', '.join(data['users']),
+                'operation': 'Token Hijacking Detected',
+                'ips': list(data['ips']),
+                'session_id': session_id,
+                'unique_ips': len(data['ips']),
+                'unique_subnets_24': len(non_excluded_subnets),
+                'unique_subnets_16': len(data['subnets_16']),
+                'event_count': len(data['events']),
+                'countries': list(countries),
+                'excluded_countries': list(set(ip['countryCode'] for ip in ip_details if ip.get('excluded'))),
+                'excluded_ip_count': len(excluded_ips),
+                'multi_country': multi_country,
+                'ip_details': ip_details,
+                'suspicious_ips': suspicious_ips,
+                'avg_abuse_score': total_abuse_score / max(len(ip_details), 1),
+                'detection_reasons': detection_reasons
+            })
+        
+        self.rule_detections[rule_id]['matches'] = matches[:10]
+        self.rule_detections[rule_id]['count'] = len(matches)
+        
+        # Track compromised users for timeline generation (CRITICAL severity)
+        if matches and severity == 'CRITICAL':
+            for m in matches:
+                users = m.get('user', '').split(', ')
+                for user in users:
+                    if user:
+                        self.compromised_users.add(user)
+        
+        if matches:
+            print(f"\n[!] {rule_title}")
+            print(f"    Severity: {severity} | Sessions Affected: {len(matches)}")
+            for m in matches[:3]:
+                reasons = ', '.join(m.get('detection_reasons', []))
+                print(f"    - Session {m['session_id'][:20]}...: {m['unique_ips']} IPs, {m['unique_subnets_24']} subnets")
+                print(f"      Countries: {', '.join(m.get('countries', []))}")
+                if m.get('suspicious_ips'):
+                    print(f"      Suspicious IPs: {len(m['suspicious_ips'])}")
+    
+    def _parse_requirement(self, req_str):
+        """Parse requirement string like '>=2' into integer"""
+        if isinstance(req_str, int):
+            return req_str
+        match = re.search(r'(\d+)', str(req_str))
+        return int(match.group(1)) if match else 1
     
     def _get_operations_from_selection(self, selection):
         """Extract operation names from selection criteria"""
@@ -576,24 +873,35 @@ class RyoshiDetectionEngine:
                     'samples': data['matches']
                 }
         
-        # Calculate totals
+        # Calculate totals from rule findings
         total_unique_ips = set()
-        for finding in self.compromises['credential_theft']:
-            total_unique_ips.update(finding.get('ip_addresses', []))
-        for finding in self.compromises['token_compromise']:
-            total_unique_ips.update(finding.get('ip_addresses', []))
+        for rule_id, data in rule_findings.items():
+            for match in data.get('samples', []):
+                ips = match.get('ips', [])
+                if isinstance(ips, list):
+                    total_unique_ips.update(ips)
+        
+        # Count by category
+        credential_theft_count = sum(1 for rid in rule_findings if 'credential-theft' in rid)
+        token_compromise_count = sum(1 for rid in rule_findings if 'token-compromise' in rid)
+        
+        # Count severity levels
+        critical_count = sum(1 for d in rule_findings.values() if d['severity'] == 'CRITICAL')
+        high_count = sum(1 for d in rule_findings.values() if d['severity'] == 'HIGH')
+        medium_count = sum(1 for d in rule_findings.values() if d['severity'] == 'MEDIUM')
         
         report = {
             'generated_at': datetime.now().isoformat(),
             'total_events_analyzed': len(self.logs),
             'unique_ips_found': len(total_unique_ips),
             'rules_loaded': len(self.rules),
+            'compromised_users': list(self.compromised_users),
             'detections': {
-                'credential_theft': len(self.compromises['credential_theft']),
-                'token_compromise': len(self.compromises['token_compromise']),
-                'rule_based_findings': len(rule_findings)
+                'total_rules_triggered': len(rule_findings),
+                'critical': critical_count,
+                'high': high_count,
+                'medium': medium_count
             },
-            'builtin_findings': self.compromises,
             'rule_findings': rule_findings
         }
         
@@ -609,9 +917,11 @@ class RyoshiDetectionEngine:
         # Generate Markdown report
         self._generate_markdown_report(output_dir, report, rule_findings)
         
-        # Save timelines
+        # Save timelines (JSON and CSV)
         for user, timeline in self.timelines.items():
             safe_user = user.replace('@', '_').replace('.', '_')
+            
+            # Save JSON timeline
             timeline_path = os.path.join(output_dir, f'ryoshi_timeline_{safe_user}.json')
             with open(timeline_path, 'w', encoding='utf-8') as f:
                 json.dump({
@@ -620,6 +930,71 @@ class RyoshiDetectionEngine:
                     'timeline': timeline
                 }, f, indent=2, default=str)
             print(f"[+] Timeline saved: {timeline_path}")
+            
+            # Save CSV timeline
+            self._save_timeline_csv(output_dir, user, safe_user, timeline)
+        
+        # Save combined timeline CSV for all users
+        if self.timelines:
+            self._save_combined_timeline_csv(output_dir)
+    
+    def _save_timeline_csv(self, output_dir, user, safe_user, timeline):
+        """Save individual user timeline as CSV"""
+        csv_path = os.path.join(output_dir, f'ryoshi_timeline_{safe_user}.csv')
+        
+        with open(csv_path, 'w', newline='', encoding='utf-8') as f:
+            writer = csv.writer(f)
+            # Write header
+            writer.writerow(['Timestamp', 'User', 'Operation', 'Workload', 'Result', 'IP Addresses', 'Session IDs'])
+            
+            # Write data rows
+            for event in timeline:
+                ips = '; '.join(event.get('ips', []))
+                sessions = '; '.join([f"{k}:{v}" for k, v in event.get('sessions', {}).items() if v])
+                writer.writerow([
+                    event.get('timestamp', ''),
+                    user,
+                    event.get('operation', ''),
+                    event.get('workload', ''),
+                    event.get('result', ''),
+                    ips,
+                    sessions
+                ])
+        print(f"[+] Timeline CSV saved: {csv_path}")
+    
+    def _save_combined_timeline_csv(self, output_dir):
+        """Save combined timeline for all compromised users as CSV"""
+        csv_path = os.path.join(output_dir, 'ryoshi_combined_timeline.csv')
+        
+        # Combine all timelines
+        all_events = []
+        for user, timeline in self.timelines.items():
+            for event in timeline:
+                all_events.append({
+                    'user': user,
+                    **event
+                })
+        
+        # Sort by timestamp
+        all_events.sort(key=lambda x: x.get('timestamp', ''))
+        
+        with open(csv_path, 'w', newline='', encoding='utf-8') as f:
+            writer = csv.writer(f)
+            writer.writerow(['Timestamp', 'User', 'Operation', 'Workload', 'Result', 'IP Addresses', 'Session IDs'])
+            
+            for event in all_events:
+                ips = '; '.join(event.get('ips', []))
+                sessions = '; '.join([f"{k}:{v}" for k, v in event.get('sessions', {}).items() if v])
+                writer.writerow([
+                    event.get('timestamp', ''),
+                    event.get('user', ''),
+                    event.get('operation', ''),
+                    event.get('workload', ''),
+                    event.get('result', ''),
+                    ips,
+                    sessions
+                ])
+        print(f"[+] Combined timeline CSV saved: {csv_path}")
 
     def _generate_html_report(self, output_dir, report, rule_findings):
         """Generate professional HTML detection report"""
@@ -1004,6 +1379,118 @@ class RyoshiDetectionEngine:
             color: var(--text-secondary);
             margin-top: 2px;
         }}
+        
+        /* Tab Navigation */
+        .tab-nav {{
+            display: flex;
+            gap: 8px;
+            margin-bottom: 24px;
+            border-bottom: 2px solid var(--border-light);
+            padding-bottom: 0;
+        }}
+        
+        .tab-btn {{
+            padding: 12px 24px;
+            background: transparent;
+            border: none;
+            font-size: 14px;
+            font-weight: 600;
+            color: var(--text-secondary);
+            cursor: pointer;
+            border-bottom: 3px solid transparent;
+            margin-bottom: -2px;
+            transition: all 0.2s ease;
+        }}
+        
+        .tab-btn:hover {{
+            color: var(--primary-blue);
+        }}
+        
+        .tab-btn.active {{
+            color: var(--primary-blue);
+            border-bottom-color: var(--primary-blue);
+        }}
+        
+        .tab-content {{
+            display: none;
+        }}
+        
+        .tab-content.active {{
+            display: block;
+        }}
+        
+        /* Timeline Table */
+        .timeline-table {{
+            width: 100%;
+            border-collapse: collapse;
+            font-size: 13px;
+        }}
+        
+        .timeline-table th {{
+            background: var(--primary-blue);
+            color: white;
+            padding: 12px;
+            text-align: left;
+            font-weight: 600;
+            position: sticky;
+            top: 0;
+        }}
+        
+        .timeline-table td {{
+            padding: 10px 12px;
+            border-bottom: 1px solid var(--border-light);
+            vertical-align: top;
+        }}
+        
+        .timeline-table tr:nth-child(even) {{
+            background: #f9fafb;
+        }}
+        
+        .timeline-table tr:hover {{
+            background: #f0f4f8;
+        }}
+        
+        .timeline-user {{
+            font-weight: 600;
+            color: var(--primary-blue);
+        }}
+        
+        .timeline-op {{
+            font-family: 'Consolas', monospace;
+            font-size: 12px;
+            background: #e8f4f8;
+            padding: 2px 6px;
+            border-radius: 4px;
+        }}
+        
+        .timeline-filter {{
+            margin-bottom: 16px;
+            display: flex;
+            gap: 16px;
+            align-items: center;
+        }}
+        
+        .timeline-filter select {{
+            padding: 8px 12px;
+            border: 1px solid var(--border-light);
+            border-radius: 6px;
+            font-size: 14px;
+        }}
+        
+        .timeline-filter input {{
+            padding: 8px 12px;
+            border: 1px solid var(--border-light);
+            border-radius: 6px;
+            font-size: 14px;
+            width: 300px;
+        }}
+        
+        .timeline-scroll {{
+            max-height: 600px;
+            overflow-y: auto;
+            border: 1px solid var(--border-light);
+            border-radius: 8px;
+        }}
     </style>
 </head>
 <body>
@@ -1024,6 +1511,12 @@ class RyoshiDetectionEngine:
     </header>
     
     <main class="container">
+        <nav class="tab-nav">
+            <button class="tab-btn active" onclick="showTab('detections')">&#128202; Detections</button>
+            <button class="tab-btn" onclick="showTab('timeline')">&#128197; Timeline</button>
+        </nav>
+        
+        <div id="detections" class="tab-content active">
         <section class="section">
             <div class="section-header">
                 <div class="section-icon blue">&#128202;</div>
@@ -1043,53 +1536,79 @@ class RyoshiDetectionEngine:
                     <div class="metric-label">Rules Loaded</div>
                 </div>
                 <div class="metric-card">
-                    <div class="metric-value critical">{report['detections']['credential_theft']}</div>
-                    <div class="metric-label">Credential Theft</div>
-                </div>
-                <div class="metric-card">
-                    <div class="metric-value warning">{report['detections']['token_compromise']}</div>
-                    <div class="metric-label">Token Compromise</div>
+                    <div class="metric-value critical">{len(self.compromised_users)}</div>
+                    <div class="metric-label">Compromised Users</div>
                 </div>
                 <div class="metric-card">
                     <div class="metric-value critical">{critical_count}</div>
-                    <div class="metric-label">Critical Rules</div>
+                    <div class="metric-label">Critical Findings</div>
+                </div>
+                <div class="metric-card">
+                    <div class="metric-value warning">{high_count}</div>
+                    <div class="metric-label">High Findings</div>
                 </div>
             </div>
         </section>
-
+"""
+        
+        # Get rule-based credential theft findings
+        rule_credential_theft = []
+        for rule_id, data in self.rule_detections.items():
+            if data['count'] > 0 and 'credential-theft' in rule_id:
+                rule_credential_theft.extend(data['matches'])
+        
+        # Get rule-based token compromise findings
+        rule_token_compromise = []
+        for rule_id, data in self.rule_detections.items():
+            if data['count'] > 0 and 'token-compromise' in rule_id:
+                rule_token_compromise.extend(data['matches'])
+        
+        # Calculate totals
+        total_credential_theft = len(rule_credential_theft)
+        total_token_compromise = len(rule_token_compromise)
+        
+        html_content += f"""
         <section class="section">
             <div class="section-header">
                 <div class="section-icon red">&#128680;</div>
                 <h2 class="section-title">Credential Theft Detections</h2>
-                <span class="risk-badge critical">{report['detections']['credential_theft']} Found</span>
+                <span class="risk-badge critical">{total_credential_theft} Found</span>
             </div>
 """
         
-        if self.compromises['credential_theft']:
-            for finding in self.compromises['credential_theft']:
-                ip_tags = ''.join([f'<span class="ip-tag">{ip}</span>' for ip in finding['ip_addresses'][:10]])
-                if len(finding['ip_addresses']) > 10:
-                    ip_tags += f'<span class="ip-tag">+{len(finding["ip_addresses"]) - 10} more</span>'
+        # Show rule-based credential theft findings first (they have better correlation data)
+        if rule_credential_theft:
+            for finding in rule_credential_theft:
+                ip_list = finding.get('ips', [])
+                ip_tags = ''.join([f'<span class="ip-tag">{ip}</span>' for ip in ip_list[:10]])
+                if len(ip_list) > 10:
+                    ip_tags += f'<span class="ip-tag">+{len(ip_list) - 10} more</span>'
+                
+                unique_sessions = finding.get('unique_sessions', 'N/A')
+                unique_ips = finding.get('unique_ips', len(ip_list))
+                event_count = finding.get('event_count', 'N/A')
+                timestamp = finding.get('timestamp', '')[:19].replace('T', ' ')
+                
                 html_content += f"""
             <div class="finding-card critical">
                 <div class="finding-header">
-                    <span class="finding-title">{finding['user']}</span>
-                    <span class="risk-badge critical">Critical</span>
+                    <span class="finding-title">{finding.get('user', 'Unknown')}</span>
+                    <span class="risk-badge critical">Critical - Rule Detection</span>
                 </div>
                 <div class="finding-body">
                     <table class="data-table">
-                        <tr><td>Duration</td><td>{finding['duration_hours']:.2f} hours</td></tr>
-                        <tr><td>Unique Sessions</td><td><strong>{finding['unique_sessions']}</strong></td></tr>
-                        <tr><td>Unique IPs</td><td><strong>{finding['unique_ips']}</strong></td></tr>
-                        <tr><td>Login Count</td><td>{finding['login_count']}</td></tr>
-                        <tr><td>First Seen</td><td>{finding['first_seen'][:19].replace('T', ' ')}</td></tr>
-                        <tr><td>Last Seen</td><td>{finding['last_seen'][:19].replace('T', ' ')}</td></tr>
+                        <tr><td>Detection Type</td><td><strong>Correlation Analysis</strong></td></tr>
+                        <tr><td>Unique Sessions</td><td><strong>{unique_sessions}</strong></td></tr>
+                        <tr><td>Unique IPs</td><td><strong>{unique_ips}</strong></td></tr>
+                        <tr><td>Total Events</td><td>{event_count}</td></tr>
+                        <tr><td>First Activity</td><td>{timestamp}</td></tr>
                         <tr><td>IP Addresses</td><td><div class="ip-list">{ip_tags}</div></td></tr>
                     </table>
                 </div>
             </div>
 """
-        else:
+        
+        if not rule_credential_theft:
             html_content += """
             <div class="empty-state">
                 <div class="empty-icon">&#9989;</div>
@@ -1104,38 +1623,85 @@ class RyoshiDetectionEngine:
             <div class="section-header">
                 <div class="section-icon orange">&#9888;</div>
                 <h2 class="section-title">Token Compromise Detections</h2>
-                <span class="risk-badge high">{report['detections']['token_compromise']} Found</span>
+                <span class="risk-badge high">{total_token_compromise} Found</span>
             </div>
 """
-        
-        if self.compromises['token_compromise']:
-            for finding in self.compromises['token_compromise']:
-                users = ', '.join(finding['users']) if finding['users'] else 'Unknown'
-                kmsi_status = '<span class="status-yes">Yes</span>' if finding['kmsi_enabled'] else '<span class="status-no">No</span>'
-                ip_tags = ''.join([f'<span class="ip-tag">{ip}</span>' for ip in finding['ip_addresses'][:8]])
-                if len(finding['ip_addresses']) > 8:
-                    ip_tags += f'<span class="ip-tag">+{len(finding["ip_addresses"]) - 8} more</span>'
+
+        # Show rule-based token compromise findings with enhanced IP reputation data
+        if rule_token_compromise:
+            for finding in rule_token_compromise:
+                ip_list = finding.get('ips', [])
+                ip_details = finding.get('ip_details', [])
+                countries = finding.get('countries', [])
+                suspicious_ips = finding.get('suspicious_ips', [])
+                detection_reasons = finding.get('detection_reasons', [])
+                
+                session_id = finding.get('session_id', 'Unknown')[:36]
+                unique_ips = finding.get('unique_ips', len(ip_list))
+                unique_subnets = finding.get('unique_subnets_24', 'N/A')
+                event_count = finding.get('event_count', 'N/A')
+                avg_abuse = finding.get('avg_abuse_score', 0)
+                
+                # Build IP table with reputation data
+                ip_table_rows = ''
+                for ip_info in ip_details[:15]:
+                    abuse_class = 'status-yes' if ip_info.get('abuse_score', 0) > 25 else ''
+                    tor_badge = '<span class="risk-badge critical" style="font-size:10px;">TOR</span>' if ip_info.get('is_tor') else ''
+                    proxy_badge = '<span class="risk-badge high" style="font-size:10px;">Proxy</span>' if ip_info.get('is_proxy') else ''
+                    ip_table_rows += f"""
+                        <tr>
+                            <td><code>{ip_info.get('ip', '')}</code></td>
+                            <td>{ip_info.get('country', 'Unknown')}</td>
+                            <td>{ip_info.get('city', '')}</td>
+                            <td class="{abuse_class}">{ip_info.get('abuse_score', 'N/A')}%</td>
+                            <td>{tor_badge} {proxy_badge}</td>
+                        </tr>"""
+                
+                # Determine risk level
+                risk_level = 'critical' if (len(countries) > 2 or avg_abuse > 30 or len(suspicious_ips) > 3) else 'high'
+                risk_text = 'CRITICAL - Multi-Country' if finding.get('multi_country') else 'HIGH - Subnet Diversity'
+                
                 html_content += f"""
-            <div class="finding-card warning">
+            <div class="finding-card {'critical' if risk_level == 'critical' else 'warning'}">
                 <div class="finding-header">
-                    <span class="finding-title">Session: {finding['session_id'][:36]}...</span>
-                    <span class="risk-badge high">High Risk</span>
+                    <span class="finding-title">Session: {session_id}...</span>
+                    <span class="risk-badge {risk_level}">{risk_text}</span>
                 </div>
                 <div class="finding-body">
                     <table class="data-table">
-                        <tr><td>Users</td><td><strong>{users}</strong></td></tr>
-                        <tr><td>Unique IPs</td><td><strong>{finding['unique_ips']}</strong></td></tr>
-                        <tr><td>Operations</td><td>{finding['operation_count']:,}</td></tr>
-                        <tr><td>KMSI Enabled</td><td>{kmsi_status}</td></tr>
-                        <tr><td>Duration</td><td>{finding['duration_hours']:.2f} hours</td></tr>
-                        <tr><td>First Seen</td><td>{finding['first_seen'][:19].replace('T', ' ')}</td></tr>
-                        <tr><td>Last Seen</td><td>{finding['last_seen'][:19].replace('T', ' ')}</td></tr>
-                        <tr><td>IP Addresses</td><td><div class="ip-list">{ip_tags}</div></td></tr>
+                        <tr><td>Detection Type</td><td><strong>Hybrid Token Theft Detection</strong></td></tr>
+                        <tr><td>Users</td><td><strong>{finding.get('user', 'Unknown')}</strong></td></tr>
+                        <tr><td>Unique IPs</td><td><strong>{unique_ips}</strong></td></tr>
+                        <tr><td>Unique /24 Subnets</td><td><strong>{unique_subnets}</strong></td></tr>
+                        <tr><td>Countries</td><td><strong>{', '.join(countries) if countries else 'Checking...'}</strong></td></tr>
+                        <tr><td>Suspicious IPs (AbuseIPDB)</td><td class="{'status-yes' if suspicious_ips else ''}">{len(suspicious_ips)}</td></tr>
+                        <tr><td>Avg. Abuse Score</td><td>{avg_abuse:.1f}%</td></tr>
+                        <tr><td>Events</td><td>{event_count}</td></tr>
+                        <tr><td>Detection Reasons</td><td>{'<br>'.join(detection_reasons)}</td></tr>
                     </table>
+                    
+                    <h4 style="margin: 16px 0 8px 0; color: var(--primary-dark);">IP Reputation Details</h4>
+                    <div style="max-height: 300px; overflow-y: auto;">
+                        <table class="data-table" style="font-size: 12px;">
+                            <thead>
+                                <tr>
+                                    <th>IP Address</th>
+                                    <th>Country</th>
+                                    <th>City</th>
+                                    <th>Abuse Score</th>
+                                    <th>Flags</th>
+                                </tr>
+                            </thead>
+                            <tbody>
+                                {ip_table_rows}
+                            </tbody>
+                        </table>
+                    </div>
                 </div>
             </div>
 """
-        else:
+        
+        if not rule_token_compromise:
             html_content += """
             <div class="empty-state">
                 <div class="empty-icon">&#9989;</div>
@@ -1187,12 +1753,54 @@ class RyoshiDetectionEngine:
         </section>
 """
 
+        # Close the detections tab div
+        html_content += """
+        </div>
+"""
+
+        # Add Timeline Tab
+        html_content += self._generate_timeline_tab_html()
+
         html_content += """
         <footer class="report-footer">
             <span class="footer-brand">Ryoshi</span> M365 eDiscovery Detection Engine | Enterprise Security Report
             <div style="margin-top: 8px; color: #999;">Confidential - For authorized recipients only</div>
         </footer>
     </main>
+    
+    <script>
+        function showTab(tabId) {{
+            // Hide all tab contents
+            document.querySelectorAll('.tab-content').forEach(function(content) {{
+                content.classList.remove('active');
+            }});
+            // Deactivate all tab buttons
+            document.querySelectorAll('.tab-btn').forEach(function(btn) {{
+                btn.classList.remove('active');
+            }});
+            // Show selected tab content
+            document.getElementById(tabId).classList.add('active');
+            // Activate clicked button
+            event.target.classList.add('active');
+        }}
+        
+        function filterTimeline() {{
+            var userFilter = document.getElementById('userFilter').value.toLowerCase();
+            var opFilter = document.getElementById('opFilter').value.toLowerCase();
+            var rows = document.querySelectorAll('#timelineTable tbody tr');
+            
+            rows.forEach(function(row) {{
+                var user = row.cells[1].textContent.toLowerCase();
+                var op = row.cells[2].textContent.toLowerCase();
+                var showRow = true;
+                
+                if (userFilter && !user.includes(userFilter)) showRow = false;
+                if (opFilter && !op.includes(opFilter)) showRow = false;
+                
+                row.style.display = showRow ? '' : 'none';
+            }});
+        }}
+    </script>
 </body>
 </html>
 """
@@ -1201,6 +1809,112 @@ class RyoshiDetectionEngine:
         with open(html_path, 'w', encoding='utf-8') as f:
             f.write(html_content)
         print(f"[+] HTML report saved: {html_path}")
+
+    def _generate_timeline_tab_html(self):
+        """Generate HTML content for the timeline tab"""
+        # Combine all timelines
+        all_events = []
+        for user, timeline in self.timelines.items():
+            for event in timeline:
+                all_events.append({
+                    'user': user,
+                    **event
+                })
+        
+        # Sort by timestamp
+        all_events.sort(key=lambda x: x.get('timestamp', ''))
+        
+        # Get unique users and operations for filters
+        unique_users = sorted(set(self.timelines.keys()))
+        unique_ops = sorted(set(e.get('operation', '') for e in all_events))
+        
+        # Build user filter options
+        user_options = '<option value="">All Users</option>'
+        for user in unique_users:
+            user_options += f'<option value="{user}">{user}</option>'
+        
+        # Build operation filter options
+        op_options = '<option value="">All Operations</option>'
+        for op in unique_ops[:50]:  # Limit to 50 most common
+            op_options += f'<option value="{op}">{op}</option>'
+        
+        timeline_html = f"""
+        <div id="timeline" class="tab-content">
+            <section class="section">
+                <div class="section-header">
+                    <div class="section-icon blue">&#128197;</div>
+                    <h2 class="section-title">Activity Timeline</h2>
+                    <span class="risk-badge medium">{len(all_events)} Events</span>
+                </div>
+"""
+        
+        if all_events:
+            timeline_html += f"""
+                <div class="timeline-filter">
+                    <label>Filter by User:</label>
+                    <select id="userFilter" onchange="filterTimeline()">
+                        {user_options}
+                    </select>
+                    <label>Filter by Operation:</label>
+                    <input type="text" id="opFilter" placeholder="Type to filter operations..." oninput="filterTimeline()">
+                </div>
+                
+                <div class="timeline-scroll">
+                    <table class="timeline-table" id="timelineTable">
+                        <thead>
+                            <tr>
+                                <th>Timestamp</th>
+                                <th>User</th>
+                                <th>Operation</th>
+                                <th>Workload</th>
+                                <th>Result</th>
+                                <th>IP Addresses</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+"""
+            # Add rows (limit to first 1000 for performance)
+            for event in all_events[:1000]:
+                ips = ', '.join(event.get('ips', [])) or '-'
+                timestamp = event.get('timestamp', '')[:19].replace('T', ' ')
+                result = event.get('result', '') or '-'
+                workload = event.get('workload', '') or '-'
+                
+                timeline_html += f"""
+                            <tr>
+                                <td>{timestamp}</td>
+                                <td class="timeline-user">{event.get('user', '')}</td>
+                                <td><span class="timeline-op">{event.get('operation', '')}</span></td>
+                                <td>{workload}</td>
+                                <td>{result}</td>
+                                <td>{ips}</td>
+                            </tr>
+"""
+            
+            timeline_html += """
+                        </tbody>
+                    </table>
+                </div>
+"""
+            if len(all_events) > 1000:
+                timeline_html += f"""
+                <div style="margin-top: 16px; padding: 12px; background: #fff3cd; border-radius: 8px; color: #856404;">
+                    <strong>Note:</strong> Showing first 1,000 of {len(all_events):,} events. Download CSV for complete timeline.
+                </div>
+"""
+        else:
+            timeline_html += """
+                <div class="empty-state">
+                    <div class="empty-icon">&#128197;</div>
+                    <div class="empty-text">No timeline data available. Timelines are generated for compromised users.</div>
+                </div>
+"""
+        
+        timeline_html += """
+            </section>
+        </div>
+"""
+        return timeline_html
 
     def _generate_markdown_report(self, output_dir, report, rule_findings):
         """Generate Markdown detection report"""
@@ -1220,58 +1934,23 @@ class RyoshiDetectionEngine:
 | Total Events Analyzed | {report['total_events_analyzed']:,} |
 | Unique IPs Found | {report.get('unique_ips_found', 0)} |
 | Rules Loaded | {report['rules_loaded']} |
-| Credential Theft Incidents | {report['detections']['credential_theft']} |
-| Token Compromise Incidents | {report['detections']['token_compromise']} |
-| Rule-Based Findings | {report['detections']['rule_based_findings']} |
+| Compromised Users | {len(self.compromised_users)} |
+| Critical Findings | {report['detections']['critical']} |
+| High Findings | {report['detections']['high']} |
 
-## Credential Theft Detections
-
-"""
-        if self.compromises['credential_theft']:
-            for finding in self.compromises['credential_theft']:
-                md_content += f"""
-### {finding['user']}
-
-| Field | Value |
-|-------|-------|
-| Duration | {finding['duration_hours']:.2f} hours |
-| Unique Sessions | {finding['unique_sessions']} |
-| Unique IPs | {finding['unique_ips']} |
-| Login Count | {finding['login_count']} |
-| First Seen | {finding['first_seen']} |
-| Last Seen | {finding['last_seen']} |
-| IP Addresses | {', '.join(finding['ip_addresses'][:10])} |
+## Compromised Users
 
 """
+        if self.compromised_users:
+            for user in sorted(self.compromised_users):
+                md_content += f"- **{user}**\n"
         else:
-            md_content += "No credential theft detected.\n"
+            md_content += "No compromised users detected.\n"
 
-        md_content += "\n## Token Compromise Detections\n\n"
-        
-        if self.compromises['token_compromise']:
-            for finding in self.compromises['token_compromise']:
-                users = ', '.join(finding['users']) if finding['users'] else 'Unknown'
-                md_content += f"""
-### Session: {finding['session_id'][:36]}...
-
-| Field | Value |
-|-------|-------|
-| Users | {users} |
-| Unique IPs | {finding['unique_ips']} |
-| Operations | {finding['operation_count']:,} |
-| KMSI Enabled | {'Yes' if finding['kmsi_enabled'] else 'No'} |
-| Duration | {finding['duration_hours']:.2f} hours |
-| First Seen | {finding['first_seen']} |
-| Last Seen | {finding['last_seen']} |
-
-"""
-        else:
-            md_content += "No token compromise detected.\n"
+        md_content += "\n## Rule Detections\n\n"
 
         if rule_findings:
             md_content += f"""
-## YAML Rule Detections
-
 | Severity | Count |
 |----------|-------|
 | Critical | {critical_count} |
@@ -1283,8 +1962,10 @@ class RyoshiDetectionEngine:
 """
             for rule_id, data in rule_findings.items():
                 md_content += f"- **{data['title']}** ({data['severity']}) - {data['count']} matches\n"
+        else:
+            md_content += "No rule detections.\n"
 
-        md_content += "\n---\n*Ryoshi M365 eDiscovery Detection Engine*\n"
+        md_content += "\n---\n*Ryoshi M365 eDiscovery Detection Engine (Rule-Based)*\n"
 
         md_path = os.path.join(output_dir, 'ryoshi_detection_report.md')
         with open(md_path, 'w', encoding='utf-8') as f:
@@ -1298,20 +1979,17 @@ class RyoshiDetectionEngine:
         print("="*60)
         print(f"Total events analyzed: {len(self.logs)}")
         print(f"Rules loaded: {len(self.rules)}")
-        print(f"\nBuilt-in Detections:")
-        print(f"  Credential theft incidents: {len(self.compromises['credential_theft'])}")
-        print(f"  Token compromise incidents: {len(self.compromises['token_compromise'])}")
+        print(f"Compromised users: {len(self.compromised_users)}")
         
         # Summarize rule-based detections by severity
         critical = sum(1 for d in self.rule_detections.values() if d['severity'] == 'CRITICAL' and d['count'] > 0)
         high = sum(1 for d in self.rule_detections.values() if d['severity'] == 'HIGH' and d['count'] > 0)
         medium = sum(1 for d in self.rule_detections.values() if d['severity'] == 'MEDIUM' and d['count'] > 0)
         
-        if self.rules:
-            print(f"\nYAML Rule Detections (by severity):")
-            print(f"  CRITICAL: {critical}")
-            print(f"  HIGH: {high}")
-            print(f"  MEDIUM: {medium}")
+        print(f"\nRule Detections by Severity:")
+        print(f"  CRITICAL: {critical}")
+        print(f"  HIGH: {high}")
+        print(f"  MEDIUM: {medium}")
         print("="*60)
 
 
@@ -1324,7 +2002,7 @@ Examples:
   %(prog)s -f /path/to/audit_log.csv
   %(prog)s -F /path/to/logs_folder/
   %(prog)s --rules-dir ./rules -f audit.csv
-  %(prog)s -f file1.csv -f file2.csv --no-builtin
+  %(prog)s -f file1.csv -f file2.csv -o /output/dir
         """
     )
     
@@ -1351,15 +2029,23 @@ Examples:
     )
     
     parser.add_argument(
-        '--no-builtin',
-        action='store_true',
-        help='Disable built-in detections (credential theft, token compromise)'
-    )
-    
-    parser.add_argument(
         '-o', '--output',
         default='/tmp',
         help='Output directory for reports (default: /tmp)'
+    )
+    
+    parser.add_argument(
+        '--abuseipdb-key',
+        default=None,
+        help='AbuseIPDB API key for IP reputation checks (can also use ABUSEIPDB_API_KEY env var)'
+    )
+    
+    parser.add_argument(
+        '--exclude-country',
+        action='append',
+        dest='exclude_countries',
+        metavar='COUNTRY',
+        help='Exclude IPs from this country in token theft detection (can be used multiple times). Example: --exclude-country=Spain --exclude-country=France'
     )
     
     args = parser.parse_args()
@@ -1370,8 +2056,20 @@ Examples:
     print("[+] Ryoshi M365 eDiscovery Detection Engine (Rule-Based)")
     print("="*60)
     
-    # Initialize engine with rules directory
-    engine = RyoshiDetectionEngine(rules_dir=args.rules_dir)
+    # Check for AbuseIPDB API key
+    abuseipdb_key = args.abuseipdb_key or os.environ.get('ABUSEIPDB_API_KEY', '')
+    if abuseipdb_key:
+        print("[+] AbuseIPDB integration enabled")
+    else:
+        print("[*] AbuseIPDB integration disabled (no API key provided)")
+        print("    Use --abuseipdb-key or set ABUSEIPDB_API_KEY environment variable")
+    
+    # Check for excluded countries
+    if args.exclude_countries:
+        print(f"[+] Excluding countries from token theft detection: {', '.join(args.exclude_countries)}")
+    
+    # Initialize engine with rules directory, API key, and excluded countries
+    engine = RyoshiDetectionEngine(rules_dir=args.rules_dir, abuseipdb_key=abuseipdb_key, exclude_countries=args.exclude_countries)
     
     if args.files:
         for filepath in args.files:
@@ -1393,20 +2091,12 @@ Examples:
     
     print(f"\n[+] Total events loaded: {len(engine.logs)}")
     
-    # Run built-in detections (unless disabled)
-    if not args.no_builtin:
-        engine.detect_credential_theft()
-        engine.detect_token_compromise()
-    
-    # Run all YAML-based rules dynamically
+    # Run all YAML-based rules
     engine.run_all_rules()
     
-    # Build timelines for compromised users
-    compromised_users = set()
-    for finding in engine.compromises['credential_theft']:
-        compromised_users.add(finding['user'])
-    
-    for user in compromised_users:
+    # Build timelines for compromised users detected by rules
+    print(f"\n[*] Building timelines for {len(engine.compromised_users)} compromised user(s)...")
+    for user in engine.compromised_users:
         engine.build_timeline(user)
     
     engine.generate_report(args.output)

@@ -3,28 +3,45 @@ id: ryoshi-m365-token-compromise-session-hijacking
 status: experimental
 description: |
   Detects token compromise where a single session/token is used from multiple
-  distinct IP addresses. This indicates an attacker has stolen a user's session
-  token and is actively replaying it across their infrastructure.
+  geographically diverse IP addresses. Uses a hybrid detection approach:
+  1. Subnet diversity analysis (3+ distinct /24 subnets)
+  2. Geographic impossible travel detection (multi-country access)
+  3. IP reputation check via AbuseIPDB integration
+  
+  This provides higher fidelity than simple IP count thresholds, reducing
+  false positives from legitimate VPN/mobile network usage.
 severity: CRITICAL
 logsource:
   category: authentication
   product: M365
   service: AzureActiveDirectory
 detection:
+  rule_type: session_correlation
   selection:
     session_id: "*"
-  filter:
-    unique_ips: ">=2"
-  condition: selection and filter | count by session_id > 1 and unique_ips >= 2
+  correlation:
+    by: session_id
+    requirements:
+      unique_ips: ">=3"
+      unique_subnets: ">=3"
+  condition: selection grouped by session_id where unique_subnets >= 3
 output_fields:
   - timestamp: CreationDate
   - session_id: SessionId
   - client_ip: ClientIP
   - operation: Operations
+  - country: GeoLocation
+  - abuse_score: AbuseIPDB
 falsepositives:
-  - Legitimate use of OAuth refresh tokens across regions
-  - CDN or load balancer network behavior
+  - Corporate VPN exit nodes (usually same country)
+  - CDN or load balancer behavior (same subnet range)
+  - Legitimate travel with proper timing (not impossible travel)
 mitigation:
-  - Revoke all OAuth tokens
+  - Revoke all OAuth tokens immediately
   - Force password reset
   - Enable conditional access policies
+  - Review inbox rules for auto-forwarding
+  - Check for data exfiltration (MailItemsAccessed)
+references:
+  - https://docs.microsoft.com/en-us/microsoft-365/compliance/advanced-audit
+  - https://www.abuseipdb.com/

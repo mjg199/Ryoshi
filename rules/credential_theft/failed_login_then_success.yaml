@@ -15,10 +15,13 @@ logsource:
   product: M365
   service: AzureActiveDirectory
 detection:
+  # This rule uses sequence correlation - failed logins followed by success
+  rule_type: sequence_correlation
   selection_failed:
     operation: UserLoginFailed
   selection_success:
     operation: UserLoggedIn
+  filter_success:
     result_status: Success
   correlation:
     by: user_id
@@ -26,7 +29,7 @@ detection:
       - selection_failed: ">=3"
       - selection_success
     timeframe: 1h
-  condition: correlation
+  condition: sequence(selection_failed, selection_success) by user_id
 output_fields:
   - timestamp: CreationDate
   - user: UserIds
