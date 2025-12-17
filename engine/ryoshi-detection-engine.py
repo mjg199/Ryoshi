@@ -188,6 +188,8 @@ class RyoshiDetectionEngine:
         self.rule_detections = {}  # All detections from YAML rules
         self.timelines = {}
         self.compromised_users = set()  # Users flagged by critical rules
+        self.compromised_sessions = {}  # Sessions flagged: {session_id: {'user': user, 'ips': set()}}
+        self.compromised_ips = set()  # IPs associated with compromised sessions
         self.ip_reputation = {}  # Store IP reputation data for reports
         self.ip_geolocation = {}  # Store IP geolocation data
         self.abuseipdb_key = abuseipdb_key or ABUSEIPDB_API_KEY
@@ -196,7 +198,7 @@ class RyoshiDetectionEngine:
         if exclude_countries:
             for c in exclude_countries:
                 self.exclude_countries.add(c.lower())
-                # Also add common country code mappings
+                # Also add common country code mappings, 
                 country_codes = {
                     'spain': 'ES', 'es': 'ES',
                     'united states': 'US', 'usa': 'US', 'us': 'US',
@@ -353,7 +355,14 @@ class RyoshiDetectionEngine:
         return False
 
     def run_all_rules(self):
-        """Execute all loaded YAML rules against the logs"""
+        """Execute all loaded YAML rules against the logs.
+        
+        Rules are executed in two passes:
+        1. First pass: Critical rules that identify compromised users/sessions
+           (correlation, session_correlation, sequence_correlation rules)
+        2. Second pass: Rules that depend on compromised status
+           (compromised_access_sequence rules)
+        """
         if not self.rules:
             print("[*] No YAML rules loaded. Skipping dynamic rule execution.")
             return
@@ -361,8 +370,38 @@ class RyoshiDetectionEngine:
         print(f"\n[*] Executing {len(self.rules)} YAML rules...")
         print("-" * 50)
         
+        # Separate rules into two groups
+        primary_rules = []  # Rules that identify compromised entities
+        dependent_rules = []  # Rules that depend on compromised status
+        
         for rule_id, rule in self.rules.items():
+            detection = rule.get('detection', {})
+            rule_type = detection.get('rule_type', 'simple')
+            
+            if rule_type == 'compromised_access_sequence':
+                dependent_rules.append((rule_id, rule))
+            else:
+                primary_rules.append((rule_id, rule))
+        
+        # First pass: Execute primary rules to identify compromised users/sessions
+        print(f"\n[*] Pass 1: Executing {len(primary_rules)} primary detection rules...")
+        for rule_id, rule in primary_rules:
             self._execute_rule(rule_id, rule)
+        
+        # Report compromised entities found
+        if self.compromised_users:
+            print(f"\n[+] Identified {len(self.compromised_users)} compromised users")
+            print(f"[+] Identified {len(self.compromised_sessions)} compromised sessions")
+            print(f"[+] Identified {len(self.compromised_ips)} compromised IPs")
+        
+        # Second pass: Execute rules that depend on compromised status
+        if dependent_rules:
+            print(f"\n[*] Pass 2: Executing {len(dependent_rules)} dependent detection rules...")
+            if not self.compromised_users and not self.compromised_sessions:
+                print("    [~] Skipping - no compromised users/sessions identified")
+            else:
+                for rule_id, rule in dependent_rules:
+                    self._execute_rule(rule_id, rule)
     
     def _execute_rule(self, rule_id, rule):
         """Execute a single rule against the logs"""
@@ -391,6 +430,9 @@ class RyoshiDetectionEngine:
             return
         elif rule_type == 'session_correlation':
             self._execute_session_rule(rule_id, rule)
+            return
+        elif rule_type == 'compromised_access_sequence':
+            self._execute_compromised_access_sequence_rule(rule_id, rule)
             return
         
         # Simple rule - match operations directly
@@ -753,13 +795,26 @@ class RyoshiDetectionEngine:
         self.rule_detections[rule_id]['matches'] = matches[:10]
         self.rule_detections[rule_id]['count'] = len(matches)
         
-        # Track compromised users for timeline generation (CRITICAL severity)
+        # Track compromised users, sessions, and IPs for timeline generation and follow-up rules
         if matches and severity == 'CRITICAL':
             for m in matches:
                 users = m.get('user', '').split(', ')
+                session_id = m.get('session_id', '')
+                ips = set(m.get('ips', []))
+                
                 for user in users:
                     if user:
                         self.compromised_users.add(user)
+                
+                # Track compromised sessions and their IPs
+                if session_id:
+                    self.compromised_sessions[session_id] = {
+                        'users': set(users),
+                        'ips': ips
+                    }
+                
+                # Track compromised IPs
+                self.compromised_ips.update(ips)
         
         if matches:
             print(f"\n[!] {rule_title}")
@@ -770,6 +825,216 @@ class RyoshiDetectionEngine:
                 print(f"      Countries: {', '.join(m.get('countries', []))}")
                 if m.get('suspicious_ips'):
                     print(f"      Suspicious IPs: {len(m['suspicious_ips'])}")
+    
+    def _execute_compromised_access_sequence_rule(self, rule_id, rule):
+        """Execute rule that detects access-then-action patterns ONLY for compromised users/sessions.
+        
+        This rule type is specifically designed for detecting:
+        - Email deletion after access (evidence destruction)
+        - File exfiltration after access
+        - Other access-followed-by-action patterns
+        
+        CRITICAL: Only analyzes events from users/sessions/IPs already identified as compromised.
+        """
+        rule_title = rule.get('title', rule_id)
+        severity = rule.get('severity', 'MEDIUM').upper()
+        detection = rule.get('detection', {})
+        
+        selection_access = detection.get('selection_access', {})
+        selection_action = detection.get('selection_action', detection.get('selection_delete', {}))
+        correlation = detection.get('correlation', {})
+        
+        access_ops = self._get_operations_from_selection(selection_access)
+        action_ops = self._get_operations_from_selection(selection_action)
+        
+        correlation_by = correlation.get('by', 'session_id')  # session_id, user, or ip
+        timeframe_str = correlation.get('timeframe', '30m')
+        
+        # Parse timeframe (e.g., '30m', '1h', '24h')
+        timeframe_minutes = 30  # Default
+        if 'm' in timeframe_str:
+            timeframe_minutes = int(re.search(r'(\d+)', timeframe_str).group(1))
+        elif 'h' in timeframe_str:
+            timeframe_minutes = int(re.search(r'(\d+)', timeframe_str).group(1)) * 60
+        
+        # First, check if we have any compromised users/sessions to analyze
+        if not self.compromised_users and not self.compromised_sessions and not self.compromised_ips:
+            # No compromised entities detected yet - skip this rule
+            return
+        
+        # Collect access and action events ONLY for compromised users/sessions/IPs
+        access_events = []
+        action_events = []
+        
+        for log_entry in self.logs:
+            user = log_entry['user_id']
+            sessions = self.extract_session_ids(log_entry)
+            ips = self.extract_ip_addresses(log_entry)
+            
+            # Check if this log entry is associated with a compromised entity
+            is_compromised = False
+            
+            # Check by user
+            if user in self.compromised_users:
+                is_compromised = True
+            
+            # Check by session
+            for sid_type, sid in sessions.items():
+                if sid and sid in self.compromised_sessions:
+                    is_compromised = True
+                    break
+            
+            # Check by IP
+            if any(ip in self.compromised_ips for ip in ips):
+                is_compromised = True
+            
+            if not is_compromised:
+                continue  # Skip non-compromised events
+            
+            # Parse timestamp
+            try:
+                ts = log_entry['timestamp'].replace('Z', '+00:00')
+                if '.' not in ts:
+                    ts = ts.replace('+00:00', '.000000+00:00')
+                timestamp = datetime.fromisoformat(ts.replace('+00:00', ''))
+            except Exception:
+                continue
+            
+            # Get email details for the event
+            audit = log_entry.get('audit_data', {})
+            email_details = self._extract_email_details(audit)
+            
+            event_data = {
+                'timestamp': timestamp,
+                'raw_ts': log_entry['timestamp'],
+                'user': user,
+                'operation': log_entry['operation'],
+                'sessions': sessions,
+                'ips': list(ips),
+                'email_details': email_details,
+                'audit_data': audit
+            }
+            
+            # Categorize event
+            if log_entry['operation'] in access_ops:
+                access_events.append(event_data)
+            elif log_entry['operation'] in action_ops:
+                action_events.append(event_data)
+        
+        # Find access-then-action sequences within the timeframe
+        matches = []
+        matched_action_ids = set()  # Avoid duplicate matching
+        
+        for action in action_events:
+            action_id = f"{action['raw_ts']}_{action['user']}_{action['operation']}"
+            if action_id in matched_action_ids:
+                continue
+            
+            # Find access events that precede this action within the timeframe
+            for access in access_events:
+                # Check correlation criteria
+                if correlation_by == 'session_id':
+                    # Must have matching session
+                    access_sids = set(access['sessions'].values())
+                    action_sids = set(action['sessions'].values())
+                    if not access_sids.intersection(action_sids):
+                        continue
+                elif correlation_by == 'user':
+                    if access['user'] != action['user']:
+                        continue
+                elif correlation_by == 'ip':
+                    if not set(access['ips']).intersection(set(action['ips'])):
+                        continue
+                
+                # Check timeframe: access must be before action and within timeframe
+                time_diff = (action['timestamp'] - access['timestamp']).total_seconds() / 60
+                if time_diff < 0 or time_diff > timeframe_minutes:
+                    continue
+                
+                # Found a match!
+                matched_action_ids.add(action_id)
+                
+                matches.append({
+                    'timestamp': action['raw_ts'],
+                    'user': action['user'],
+                    'operation': action['operation'],
+                    'ips': action['ips'],
+                    'sessions': action['sessions'],
+                    'access_timestamp': access['raw_ts'],
+                    'access_operation': access['operation'],
+                    'time_delta_minutes': round(time_diff, 1),
+                    'email_details': action.get('email_details', {}),
+                    'access_email_details': access.get('email_details', {})
+                })
+                break  # One match per action event
+        
+        self.rule_detections[rule_id]['matches'] = matches[:20]  # Keep more samples for evidence
+        self.rule_detections[rule_id]['count'] = len(matches)
+        
+        if matches:
+            print(f"\n[!] {rule_title}")
+            print(f"    Severity: {severity} | Matches: {len(matches)} (from compromised users/sessions only)")
+            for m in matches[:3]:
+                print(f"    - {m['user']}: {m['access_operation']} -> {m['operation']} ({m['time_delta_minutes']}m)")
+    
+    def _extract_email_details(self, audit_data):
+        """Extract email Subject, InternetMessageId, and other details from audit data"""
+        details = {
+            'subject': '',
+            'internet_message_id': '',
+            'item_id': '',
+            'folder_path': ''
+        }
+        
+        # Check AffectedItems (for delete/move operations)
+        affected_items = audit_data.get('AffectedItems', [])
+        if affected_items:
+            first_item = affected_items[0] if isinstance(affected_items, list) else affected_items
+            if isinstance(first_item, dict):
+                details['subject'] = first_item.get('Subject', '')
+                details['internet_message_id'] = first_item.get('InternetMessageId', '')
+                details['item_id'] = first_item.get('Id', '') or first_item.get('ImmutableId', '')
+                parent_folder = first_item.get('ParentFolder', {})
+                if isinstance(parent_folder, dict):
+                    details['folder_path'] = parent_folder.get('Path', '')
+        
+        # Check Item (for send/create operations)
+        item = audit_data.get('Item', {})
+        if item and isinstance(item, dict):
+            if not details['subject']:
+                details['subject'] = item.get('Subject', '')
+            if not details['internet_message_id']:
+                details['internet_message_id'] = item.get('InternetMessageId', '')
+            if not details['item_id']:
+                details['item_id'] = item.get('Id', '') or item.get('ImmutableId', '')
+        
+        # Check Folders (for MailItemsAccessed)
+        folders = audit_data.get('Folders', [])
+        for folder in folders:
+            if isinstance(folder, dict):
+                folder_items = folder.get('FolderItems', [])
+                for f_item in folder_items:
+                    if isinstance(f_item, dict):
+                        if not details['subject']:
+                            details['subject'] = f_item.get('Subject', '')
+                        if not details['internet_message_id']:
+                            details['internet_message_id'] = f_item.get('InternetMessageId', '')
+                        if not details['item_id']:
+                            details['item_id'] = f_item.get('Id', '') or f_item.get('ImmutableId', '')
+                if not details['folder_path']:
+                    details['folder_path'] = folder.get('Path', '')
+        
+        # Check ObjectId for SharePoint/OneDrive operations
+        object_id = audit_data.get('ObjectId', '')
+        if object_id and not details['subject']:
+            # Use filename as detail for file operations
+            source_filename = audit_data.get('SourceFileName', '')
+            if source_filename:
+                details['subject'] = source_filename
+            else:
+                details['subject'] = object_id
+        
+        return details
     
     def _parse_requirement(self, req_str):
         """Parse requirement string like '>=2' into integer"""
@@ -832,7 +1097,14 @@ class RyoshiDetectionEngine:
         return None
 
     def build_timeline(self, user):
-        """Build activity timeline for a compromised user"""
+        """Build activity timeline for a compromised user.
+        
+        Format:
+        - Timestamp
+        - Operation
+        - Detail (Subject/InternetMessageId/ObjectId)
+        - IP
+        """
         print(f"\n[*] Building activity timeline for {user}...")
         
         events = []
@@ -840,20 +1112,103 @@ class RyoshiDetectionEngine:
             if log_entry['user_id'] == user:
                 ips = self.extract_ip_addresses(log_entry)
                 sessions = self.extract_session_ids(log_entry)
+                audit = log_entry.get('audit_data', {})
+                
+                # Extract detail (Subject, InternetMessageId, ObjectId, etc.)
+                details = self._extract_timeline_details(audit)
                 
                 events.append({
                     'timestamp': log_entry['timestamp'],
                     'operation': log_entry['operation'],
-                    'ips': list(ips),
+                    'detail': details,
+                    'ip': list(ips)[0] if ips else '',  # Primary IP
+                    'all_ips': list(ips),
                     'sessions': sessions,
-                    'workload': log_entry['audit_data'].get('Workload', ''),
-                    'result': log_entry['audit_data'].get('ResultStatus', '')
+                    'workload': audit.get('Workload', ''),
+                    'result': audit.get('ResultStatus', '')
                 })
         
-        events.sort(key=lambda x: x['timestamp'])
+        events.sort(key=lambda x: x['timestamp'], reverse=True)  # Most recent first
         self.timelines[user] = events
         print(f"[+] Found {len(events)} events for {user}")
         return events
+    
+    def _extract_timeline_details(self, audit_data):
+        """Extract detail string for timeline (Subject/InternetMessageId/ObjectId).
+        
+        Priority order:
+        1. Subject (email subject)
+        2. InternetMessageId
+        3. ObjectId (file path/URL)
+        4. ListItemUniqueId
+        5. SiteUrl + SourceRelativeUrl
+        6. SourceFileName
+        7. 'no_detail' if nothing found
+        """
+        details = []
+        
+        # === Exchange operations (Folders, AffectedItems, Item) ===
+        
+        # Check Folders (MailItemsAccessed)
+        folders = audit_data.get('Folders', [])
+        for folder in folders:
+            if isinstance(folder, dict):
+                folder_items = folder.get('FolderItems', [])
+                for f_item in folder_items:
+                    if isinstance(f_item, dict):
+                        detail = (f_item.get('Subject') or 
+                                  f_item.get('InternetMessageId') or 
+                                  f_item.get('Id'))
+                        if detail:
+                            details.append(detail)
+        
+        # Check AffectedItems (SoftDelete, HardDelete, MoveToDeletedItems)
+        affected_items = audit_data.get('AffectedItems', [])
+        for item in affected_items:
+            if isinstance(item, dict):
+                detail = (item.get('Subject') or 
+                          item.get('InternetMessageId') or
+                          (item.get('ParentFolder') or {}).get('Path') or
+                          item.get('ImmutableId') or
+                          item.get('Id'))
+                if detail:
+                    details.append(detail)
+        
+        # Check Item (Send, Create)
+        item = audit_data.get('Item', {})
+        if item and isinstance(item, dict):
+            detail = (item.get('Subject') or 
+                      item.get('InternetMessageId') or
+                      (item.get('ParentFolder') or {}).get('Path') or
+                      item.get('ImmutableId') or
+                      item.get('Id'))
+            if detail:
+                details.append(detail)
+        
+        # === OneDrive/SharePoint operations ===
+        
+        if not details:
+            object_id = audit_data.get('ObjectId')
+            list_item_id = audit_data.get('ListItemUniqueId')
+            site_url = audit_data.get('SiteUrl', '')
+            rel_url = audit_data.get('SourceRelativeUrl', '')
+            file_name = audit_data.get('SourceFileName', '')
+            
+            if object_id:
+                details.append(object_id)
+            elif list_item_id:
+                details.append(list_item_id)
+            elif site_url and rel_url:
+                details.append(site_url + rel_url)
+            elif rel_url and file_name:
+                details.append(rel_url + '/' + file_name)
+            elif file_name:
+                details.append(file_name)
+        
+        # Return first detail or 'no_detail'
+        if details:
+            return details[0]
+        return 'no_detail'
 
     def generate_report(self, output_dir='/tmp'):
         """Generate detection and timeline reports (JSON, HTML, Markdown)"""
@@ -939,26 +1294,30 @@ class RyoshiDetectionEngine:
             self._save_combined_timeline_csv(output_dir)
     
     def _save_timeline_csv(self, output_dir, user, safe_user, timeline):
-        """Save individual user timeline as CSV"""
+        """Save individual user timeline as CSV:
+        Timestamp, Operation, Detail, IP
+        """
         csv_path = os.path.join(output_dir, f'ryoshi_timeline_{safe_user}.csv')
         
         with open(csv_path, 'w', newline='', encoding='utf-8') as f:
             writer = csv.writer(f)
             # Write header
-            writer.writerow(['Timestamp', 'User', 'Operation', 'Workload', 'Result', 'IP Addresses', 'Session IDs'])
+            writer.writerow(['Timestamp', 'Operation', 'Detail', 'IP'])
             
-            # Write data rows
+            # Write data rows (already sorted by timestamp, most recent first)
             for event in timeline:
-                ips = '; '.join(event.get('ips', []))
-                sessions = '; '.join([f"{k}:{v}" for k, v in event.get('sessions', {}).items() if v])
+                # Clean timestamp (remove trailing Z and milliseconds if present)
+                ts = event.get('timestamp', '')
+                if ts.endswith('Z'):
+                    ts = ts[:-1]
+                if '.' in ts:
+                    ts = ts.split('.')[0]  # Remove milliseconds
+                
                 writer.writerow([
-                    event.get('timestamp', ''),
-                    user,
+                    ts,
                     event.get('operation', ''),
-                    event.get('workload', ''),
-                    event.get('result', ''),
-                    ips,
-                    sessions
+                    event.get('detail', 'no_detail'),
+                    event.get('ip', '')
                 ])
         print(f"[+] Timeline CSV saved: {csv_path}")
     
@@ -975,24 +1334,28 @@ class RyoshiDetectionEngine:
                     **event
                 })
         
-        # Sort by timestamp
-        all_events.sort(key=lambda x: x.get('timestamp', ''))
+        # Sort by timestamp (most recent first)
+        all_events.sort(key=lambda x: x.get('timestamp', ''), reverse=True)
         
         with open(csv_path, 'w', newline='', encoding='utf-8') as f:
             writer = csv.writer(f)
-            writer.writerow(['Timestamp', 'User', 'Operation', 'Workload', 'Result', 'IP Addresses', 'Session IDs'])
+            # Write header with user column for combined output
+            writer.writerow(['Timestamp', 'User', 'Operation', 'Detail', 'IP'])
             
             for event in all_events:
-                ips = '; '.join(event.get('ips', []))
-                sessions = '; '.join([f"{k}:{v}" for k, v in event.get('sessions', {}).items() if v])
+                # Clean timestamp
+                ts = event.get('timestamp', '')
+                if ts.endswith('Z'):
+                    ts = ts[:-1]
+                if '.' in ts:
+                    ts = ts.split('.')[0]
+                
                 writer.writerow([
-                    event.get('timestamp', ''),
+                    ts,
                     event.get('user', ''),
                     event.get('operation', ''),
-                    event.get('workload', ''),
-                    event.get('result', ''),
-                    ips,
-                    sessions
+                    event.get('detail', 'no_detail'),
+                    event.get('ip', '')
                 ])
         print(f"[+] Combined timeline CSV saved: {csv_path}")
 

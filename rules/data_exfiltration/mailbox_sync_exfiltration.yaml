@@ -1,0 +1,82 @@
+title: Mailbox Sync Exfiltration - Full Sync Upload Detected
+id: ryoshi-m365-mailbox-sync-exfiltration
+status: experimental
+description: |
+  Detects FileSyncUploadedFull operations that may indicate data exfiltration.
+  This operation occurs when a mailbox or file is fully synced/uploaded, which
+  can indicate:
+  - Attacker synchronizing mailbox contents to external storage
+  - Mass data copy to OneDrive for later exfiltration  
+  - Evidence of mailbox export/backup by unauthorized party
+  
+  IMPORTANT: This rule ONLY triggers for users/sessions already identified
+  as compromised by critical rules (e.g., token theft detection).
+  This prevents false positives from legitimate OneDrive sync activity.
+severity: HIGH
+logsource:
+  category: data_exfiltration
+  product: M365
+  service: OneDrive
+detection:
+  rule_type: compromised_access_sequence
+  selection_access:
+    operation:
+      - MailItemsAccessed
+      - FileAccessed
+      - FileDownloaded
+  selection_action:
+    operation: FileSyncUploadedFull
+  correlation:
+    by: user
+    sequence:
+      - selection_access
+      - selection_action
+    timeframe: 24h
+  condition: correlation
+output_fields:
+  - timestamp: CreationDate
+  - user: UserId
+  - operation: Operation
+  - file_path: ObjectId
+  - file_name: SourceFileName
+  - file_size: FileSyncBytesCommitted
+  - client_ip: ClientIP
+  - workload: Workload
+report:
+  title: "Mailbox Sync Exfiltration Detection"
+  severity: HIGH
+  template: |
+    User: {user}
+    
+    Exfiltration Indicator:
+    - Operation: {operation}
+    - File: {file_name}
+    - Path: {file_path}
+    - Size: {file_size} bytes
+    
+    Access Pattern:
+    - Data Accessed: {access_timestamp}
+    - Sync Upload: {timestamp}
+    - Time Between: {time_delta} minutes
+    
+    Source IP: {client_ip}
+    Workload: {workload}
+    
+    Potential Indicators:
+    - Data copied to cloud storage for exfiltration
+    - Mailbox backup/export by attacker
+    - Evidence collection by threat actor
+    
+    Investigation Steps:
+    - Review all FileSyncUploadedFull operations for this user
+    - Check OneDrive activity for unusual patterns
+    - Correlate with mailbox access patterns
+falsepositives:
+  - Legitimate OneDrive sync (filtered by requiring compromised status)
+  - Normal file backup operations
+  - Automated backup solutions
+mitigation:
+  - Review OneDrive sharing permissions
+  - Check for external sharing links
+  - Audit OneDrive activity logs
+  - Consider blocking OneDrive sync for compromised accounts

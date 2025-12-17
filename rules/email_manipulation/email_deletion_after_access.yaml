@@ -8,18 +8,20 @@ description: |
   - Destruction of evidence (security alerts, password resets)
   - Hiding unauthorized access from the legitimate user
   
-  Based on log analysis: 3,182 SoftDelete + 346 HardDelete + 4,903 MoveToDeletedItems
-  operations observed in sample data.
+  IMPORTANT: This rule ONLY triggers for users/sessions already identified
+  as compromised by critical rules (e.g., token theft detection).
+  This prevents false positives from normal email deletion behavior.
 severity: MEDIUM
 logsource:
   category: email_manipulation
   product: M365
   service: Exchange
 detection:
+  rule_type: compromised_access_sequence
   selection_access:
     operation: MailItemsAccessed
     result_status: Succeeded
-  selection_delete:
+  selection_action:
     operation:
       - SoftDelete
       - HardDelete
@@ -28,7 +30,7 @@ detection:
     by: session_id
     sequence:
       - selection_access
-      - selection_delete
+      - selection_action
     timeframe: 30m
   condition: correlation
 output_fields:
