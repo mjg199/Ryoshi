@@ -193,29 +193,46 @@ class RyoshiDetectionEngine:
         self.ip_reputation = {}  # Store IP reputation data for reports
         self.ip_geolocation = {}  # Store IP geolocation data
         self.abuseipdb_key = abuseipdb_key or ABUSEIPDB_API_KEY
-        # Normalize excluded countries to lowercase for comparison
+        
+        # Comprehensive country code mappings (bidirectional)
+        self.country_name_to_code = {
+            'spain': 'es', 'united states': 'us', 'usa': 'us', 'united kingdom': 'gb',
+            'uk': 'gb', 'great britain': 'gb', 'germany': 'de', 'france': 'fr',
+            'italy': 'it', 'portugal': 'pt', 'netherlands': 'nl', 'belgium': 'be',
+            'norway': 'no', 'sweden': 'se', 'ireland': 'ie', 'nigeria': 'ng',
+            'canada': 'ca', 'australia': 'au', 'brazil': 'br', 'mexico': 'mx',
+            'japan': 'jp', 'china': 'cn', 'india': 'in', 'russia': 'ru',
+            'south africa': 'za', 'argentina': 'ar', 'poland': 'pl', 'switzerland': 'ch',
+            'austria': 'at', 'denmark': 'dk', 'finland': 'fi', 'greece': 'gr',
+            'hungary': 'hu', 'czech republic': 'cz', 'czechia': 'cz', 'romania': 'ro',
+            'ukraine': 'ua', 'turkey': 'tr', 'israel': 'il', 'egypt': 'eg',
+            'south korea': 'kr', 'korea': 'kr', 'singapore': 'sg', 'hong kong': 'hk',
+            'taiwan': 'tw', 'indonesia': 'id', 'malaysia': 'my', 'thailand': 'th',
+            'vietnam': 'vn', 'philippines': 'ph', 'new zealand': 'nz', 'chile': 'cl',
+            'colombia': 'co', 'peru': 'pe', 'venezuela': 've', 'ecuador': 'ec',
+            'morocco': 'ma', 'kenya': 'ke', 'ghana': 'gh', 'senegal': 'sn'
+        }
+        self.country_code_to_name = {v: k for k, v in self.country_name_to_code.items() if len(k) > 2}
+        
+        # Normalize excluded countries - store as lowercase ISO codes
+        # Supports both multiple --exclude-country flags and comma-separated values
         self.exclude_countries = set()
         if exclude_countries:
             for c in exclude_countries:
-                self.exclude_countries.add(c.lower())
-                # Also add common country code mappings, 
-                country_codes = {
-                    'spain': 'ES', 'es': 'ES',
-                    'united states': 'US', 'usa': 'US', 'us': 'US',
-                    'united kingdom': 'GB', 'uk': 'GB', 'gb': 'GB',
-                    'germany': 'DE', 'de': 'DE',
-                    'france': 'FR', 'fr': 'FR',
-                    'italy': 'IT', 'it': 'IT',
-                    'portugal': 'PT', 'pt': 'PT',
-                    'netherlands': 'NL', 'nl': 'NL',
-                    'belgium': 'BE', 'be': 'BE',
-                    'norway': 'NO', 'no': 'NO',
-                    'sweden': 'SE', 'se': 'SE',
-                    'ireland': 'IE', 'ie': 'IE',
-                    'nigeria': 'NG', 'ng': 'NG',
-                }
-                if c.lower() in country_codes:
-                    self.exclude_countries.add(country_codes[c.lower()].lower())
+                # Split by comma to support "ES,FR" or "ES, FR" format
+                country_parts = [part.strip().lower() for part in c.split(',')]
+                for c_lower in country_parts:
+                    if not c_lower:
+                        continue
+                    # If it's a country name, convert to ISO code
+                    if c_lower in self.country_name_to_code:
+                        self.exclude_countries.add(self.country_name_to_code[c_lower])
+                    elif len(c_lower) == 2:
+                        # Already an ISO code
+                        self.exclude_countries.add(c_lower)
+                    else:
+                        # Try as-is (might be a name not in our mapping)
+                        self.exclude_countries.add(c_lower)
         
         # Auto-discover rules directory
         if rules_dir is None:
@@ -357,51 +374,77 @@ class RyoshiDetectionEngine:
     def run_all_rules(self):
         """Execute all loaded YAML rules against the logs.
         
-        Rules are executed in two passes:
-        1. First pass: Critical rules that identify compromised users/sessions
-           (correlation, session_correlation, sequence_correlation rules)
-        2. Second pass: Rules that depend on compromised status
-           (compromised_access_sequence rules)
+        Optimized two-phase execution flow:
+        
+        Phase 1 - Compromise Detection:
+          Run ONLY token theft and credential theft rules to identify compromised accounts.
+          These are rules with IDs containing 'token-compromise' or 'credential-theft',
+          or rules in the credential_theft category with session_correlation or 
+          sequence_correlation rule types.
+        
+        Phase 2 - Secondary Rule Evaluation:
+          Run ALL remaining rules ONLY against accounts flagged as compromised in Phase 1.
+          Non-compromised accounts are skipped entirely, significantly reducing execution time.
         """
         if not self.rules:
             print("[*] No YAML rules loaded. Skipping dynamic rule execution.")
             return
         
-        print(f"\n[*] Executing {len(self.rules)} YAML rules...")
+        print(f"\n[*] Executing {len(self.rules)} YAML rules (optimized two-phase)...")
         print("-" * 50)
         
-        # Separate rules into two groups
-        primary_rules = []  # Rules that identify compromised entities
-        dependent_rules = []  # Rules that depend on compromised status
+        # Separate rules into groups based on execution phase
+        compromise_detection_rules = []  # Phase 1: Token/credential theft (identify compromised accounts)
+        secondary_rules = []  # Phase 2: All other rules (run only against compromised accounts)
         
         for rule_id, rule in self.rules.items():
             detection = rule.get('detection', {})
             rule_type = detection.get('rule_type', 'simple')
+            rule_file = rule.get('_file', '')
             
-            if rule_type == 'compromised_access_sequence':
-                dependent_rules.append((rule_id, rule))
+            # Phase 1 rules: Token theft and credential theft detection
+            # These identify compromised accounts
+            is_compromise_detection = (
+                'token-compromise' in rule_id.lower() or
+                'credential-theft' in rule_id.lower() or
+                'credential_theft' in rule_file.lower() or
+                rule_type in ['session_correlation', 'sequence_correlation']
+            )
+            
+            if is_compromise_detection:
+                compromise_detection_rules.append((rule_id, rule))
             else:
-                primary_rules.append((rule_id, rule))
+                secondary_rules.append((rule_id, rule))
         
-        # First pass: Execute primary rules to identify compromised users/sessions
-        print(f"\n[*] Pass 1: Executing {len(primary_rules)} primary detection rules...")
-        for rule_id, rule in primary_rules:
+        # Phase 1: Execute compromise detection rules to identify compromised users/sessions
+        print(f"\n[*] Phase 1 - Compromise Detection: Running {len(compromise_detection_rules)} rules...")
+        print("    (Token theft and credential theft detection)")
+        for rule_id, rule in compromise_detection_rules:
             self._execute_rule(rule_id, rule)
         
         # Report compromised entities found
         if self.compromised_users:
-            print(f"\n[+] Identified {len(self.compromised_users)} compromised users")
-            print(f"[+] Identified {len(self.compromised_sessions)} compromised sessions")
-            print(f"[+] Identified {len(self.compromised_ips)} compromised IPs")
+            print(f"\n[+] Phase 1 Results:")
+            print(f"    - Compromised users: {len(self.compromised_users)}")
+            print(f"    - Compromised sessions: {len(self.compromised_sessions)}")
+            print(f"    - Compromised IPs: {len(self.compromised_ips)}")
+            for user in list(self.compromised_users)[:5]:
+                print(f"      • {user}")
+            if len(self.compromised_users) > 5:
+                print(f"      ... and {len(self.compromised_users) - 5} more")
+        else:
+            print(f"\n[*] Phase 1 Results: No compromised accounts detected")
         
-        # Second pass: Execute rules that depend on compromised status
-        if dependent_rules:
-            print(f"\n[*] Pass 2: Executing {len(dependent_rules)} dependent detection rules...")
+        # Phase 2: Execute secondary rules ONLY against compromised accounts
+        if secondary_rules:
+            print(f"\n[*] Phase 2 - Secondary Rule Evaluation: {len(secondary_rules)} rules...")
             if not self.compromised_users and not self.compromised_sessions:
-                print("    [~] Skipping - no compromised users/sessions identified")
+                print("    [~] Skipping Phase 2 - no compromised accounts to analyze")
+                print("    [+] Performance optimization: Skipped evaluation of non-compromised accounts")
             else:
-                for rule_id, rule in dependent_rules:
-                    self._execute_rule(rule_id, rule)
+                print(f"    (Analyzing only {len(self.compromised_users)} compromised user(s))")
+                for rule_id, rule in secondary_rules:
+                    self._execute_rule_for_compromised_only(rule_id, rule)
     
     def _execute_rule(self, rule_id, rule):
         """Execute a single rule against the logs"""
@@ -470,6 +513,91 @@ class RyoshiDetectionEngine:
                 for m in matches[:2]:
                     print(f"    - {m['user']} @ {m['timestamp']}")
     
+    def _execute_rule_for_compromised_only(self, rule_id, rule):
+        """Execute a rule ONLY against events from compromised users/sessions/IPs.
+        
+        This is a performance optimization for Phase 2 rules that filters out
+        all events from non-compromised accounts before rule evaluation.
+        """
+        rule_title = rule.get('title', rule_id)
+        severity = rule.get('severity', 'MEDIUM').upper()
+        
+        # Initialize detection results for this rule
+        if rule_id not in self.rule_detections:
+            self.rule_detections[rule_id] = {
+                'title': rule_title,
+                'severity': severity,
+                'matches': [],
+                'count': 0
+            }
+        
+        # Get detection criteria from rule
+        detection = rule.get('detection', {})
+        rule_type = detection.get('rule_type', 'simple')
+        
+        # For compromised_access_sequence rules, use the dedicated method
+        if rule_type == 'compromised_access_sequence':
+            self._execute_compromised_access_sequence_rule(rule_id, rule)
+            return
+        
+        # For simple rules, filter logs to only compromised users first
+        selection = detection.get('selection', {})
+        ops_to_match = self._get_operations_from_selection(selection)
+        
+        # Pre-filter logs to only include compromised users/sessions/IPs
+        compromised_logs = []
+        for log_entry in self.logs:
+            user = log_entry['user_id']
+            sessions = self.extract_session_ids(log_entry)
+            ips = self.extract_ip_addresses(log_entry)
+            
+            # Check if this log entry is from a compromised entity
+            is_compromised = False
+            if user in self.compromised_users:
+                is_compromised = True
+            elif any(sid in self.compromised_sessions for sid in sessions.values() if sid):
+                is_compromised = True
+            elif any(ip in self.compromised_ips for ip in ips):
+                is_compromised = True
+            
+            if is_compromised:
+                compromised_logs.append(log_entry)
+        
+        # If no compromised logs to analyze, skip
+        if not compromised_logs:
+            return
+        
+        # Search filtered logs for matching operations
+        matches = []
+        for log_entry in compromised_logs:
+            if self._matches_selection(log_entry, selection, ops_to_match):
+                matches.append({
+                    'timestamp': log_entry['timestamp'],
+                    'user': log_entry['user_id'],
+                    'operation': log_entry['operation'],
+                    'ips': list(self.extract_ip_addresses(log_entry))
+                })
+        
+        # Get threshold and timeframe if specified
+        condition = detection.get('condition', '')
+        threshold = self._extract_threshold(condition)
+        
+        # Apply threshold logic if specified
+        if threshold and len(matches) < threshold:
+            return
+        
+        # Store results
+        self.rule_detections[rule_id]['matches'] = matches[:10]
+        self.rule_detections[rule_id]['count'] = len(matches)
+        
+        # Print findings
+        if matches:
+            print(f"\n[!] {rule_title}")
+            print(f"    Severity: {severity} | Matches: {len(matches)} (compromised users only)")
+            if matches[:2]:
+                for m in matches[:2]:
+                    print(f"    - {m['user']} @ {m['timestamp']}")
+
     def _execute_correlation_rule(self, rule_id, rule):
         """Execute correlation rule - group by user and check session/IP requirements"""
         rule_title = rule.get('title', rule_id)
@@ -701,28 +829,39 @@ class RyoshiDetectionEngine:
             print(f"    [*] Session {session_id[:25]}... has {subnet_count} subnets - checking geolocation...")
             
             for ip in list(data['ips'])[:20]:  # Limit to first 20 IPs for performance
-                ip_info = {'ip': ip, 'country': 'Unknown', 'city': '', 'abuse_score': 0, 'excluded': False}
+                ip_info = {'ip': ip, 'country': 'N/A', 'city': '', 'abuse_score': 0, 'excluded': False}
+                
+                # Detect Microsoft/Azure IPs (common M365 ranges)
+                is_microsoft_ip = ip.startswith(('13.', '20.', '40.', '52.', '104.', '168.', '191.'))
                 
                 # Get geolocation
                 geo = get_ip_geolocation(ip)
                 if geo:
-                    ip_info['country'] = geo.get('country', 'Unknown')
+                    ip_info['country'] = geo.get('country', 'N/A') or 'N/A'
                     ip_info['countryCode'] = geo.get('countryCode', '')
                     ip_info['city'] = geo.get('city', '')
                     ip_info['lat'] = geo.get('lat', 0)
                     ip_info['lon'] = geo.get('lon', 0)
                     ip_info['isp'] = geo.get('isp', '')
                     
-                    # Check if this country should be excluded
+                    # Check if this country should be excluded (normalize to lowercase for comparison)
                     country_code = geo.get('countryCode', '').lower()
                     country_name = geo.get('country', '').lower()
-                    if country_code in self.exclude_countries or country_name in self.exclude_countries:
+                    # Check both ISO code and country name against exclusion list
+                    is_excluded = (country_code in self.exclude_countries or 
+                                   country_name in self.exclude_countries or
+                                   self.country_name_to_code.get(country_name, '') in self.exclude_countries)
+                    if is_excluded:
                         ip_info['excluded'] = True
                         excluded_ips.append(ip)
                     else:
-                        countries.add(geo.get('countryCode', 'Unknown'))
+                        countries.add(geo.get('countryCode', 'N/A'))
                     
                     self.ip_geolocation[ip] = geo
+                elif is_microsoft_ip:
+                    # Label Microsoft IPs when geolocation fails
+                    ip_info['country'] = 'Microsoft/Azure'
+                    ip_info['isp'] = 'Microsoft Corporation'
                 
                 # Check AbuseIPDB
                 if self.abuseipdb_key:
@@ -1292,6 +1431,14 @@ class RyoshiDetectionEngine:
         # Save combined timeline CSV for all users
         if self.timelines:
             self._save_combined_timeline_csv(output_dir)
+        
+        # Generate investigation support CSVs
+        self._save_suspicious_sessions_csv(output_dir)
+        self._save_session_ips_csv(output_dir)
+        self._save_inbox_rules_csv(output_dir)
+        
+        # Generate unified detection report CSV
+        self._save_detection_report_csv(output_dir, rule_findings)
     
     def _save_timeline_csv(self, output_dir, user, safe_user, timeline):
         """Save individual user timeline as CSV:
@@ -1358,6 +1505,382 @@ class RyoshiDetectionEngine:
                     event.get('ip', '')
                 ])
         print(f"[+] Combined timeline CSV saved: {csv_path}")
+
+    def _save_suspicious_sessions_csv(self, output_dir):
+        """Save suspicious sessions per user as CSV.
+        
+        One row per user with columns:
+        - User: User identifier
+        - SessionIDs: Comma-separated list of suspicious session IDs
+        """
+        if not self.compromised_sessions and not self.compromised_users:
+            return
+        
+        csv_path = os.path.join(output_dir, 'ryoshi_suspicious_sessions.csv')
+        
+        # Group sessions by user
+        user_sessions = defaultdict(set)
+        for session_id, session_data in self.compromised_sessions.items():
+            users = session_data.get('users', set())
+            for user in users:
+                user_sessions[user].add(session_id)
+        
+        # Also include users from compromised_users who might not have sessions tracked
+        for user in self.compromised_users:
+            if user not in user_sessions:
+                user_sessions[user] = set()
+        
+        with open(csv_path, 'w', newline='', encoding='utf-8') as f:
+            writer = csv.writer(f)
+            writer.writerow(['User', 'SessionIDs'])
+            
+            for user in sorted(user_sessions.keys()):
+                sessions = user_sessions[user]
+                session_list = '; '.join(sorted(sessions)) if sessions else 'N/A'
+                writer.writerow([user, session_list])
+        
+        print(f"[+] Suspicious sessions CSV saved: {csv_path}")
+
+    def _save_session_ips_csv(self, output_dir):
+        """Save IP addresses per session as CSV.
+        
+        One row per session with columns:
+        - SessionID: Session identifier
+        - IPAddresses: Comma-separated list of associated IP addresses
+        - User: Associated user(s)
+        """
+        if not self.compromised_sessions:
+            return
+        
+        csv_path = os.path.join(output_dir, 'ryoshi_session_ips.csv')
+        
+        with open(csv_path, 'w', newline='', encoding='utf-8') as f:
+            writer = csv.writer(f)
+            writer.writerow(['SessionID', 'IPAddresses', 'User'])
+            
+            for session_id, session_data in sorted(self.compromised_sessions.items()):
+                ips = session_data.get('ips', set())
+                users = session_data.get('users', set())
+                
+                ip_list = '; '.join(sorted(ips)) if ips else 'N/A'
+                user_list = '; '.join(sorted(users)) if users else 'N/A'
+                
+                writer.writerow([session_id, ip_list, user_list])
+        
+        print(f"[+] Session IPs CSV saved: {csv_path}")
+
+    def _save_inbox_rules_csv(self, output_dir):
+        """Save inbox rule creation details as CSV.
+        
+        Extracts full details from inbox rule operations including:
+        - Timestamp
+        - User
+        - Operation (New-InboxRule, Set-InboxRule, etc.)
+        - RuleName
+        - RuleCondition
+        - ForwardTo
+        - ForwardAsAttachmentTo
+        - RedirectTo
+        - DeleteMessage
+        - MoveToFolder
+        - MarkAsRead
+        - ClientIP
+        - SessionID
+        - FullParameters (JSON string of all parameters)
+        """
+        inbox_rule_ops = ['New-InboxRule', 'Set-InboxRule', 'Enable-InboxRule', 'UpdateInboxRules']
+        
+        inbox_rules = []
+        for log_entry in self.logs:
+            if log_entry['operation'] in inbox_rule_ops:
+                audit_data = log_entry.get('audit_data', {})
+                parameters = audit_data.get('Parameters', [])
+                
+                # Extract parameters into a dict
+                params_dict = {}
+                if isinstance(parameters, list):
+                    for param in parameters:
+                        if isinstance(param, dict) and 'Name' in param and 'Value' in param:
+                            params_dict[param['Name']] = param['Value']
+                elif isinstance(parameters, dict):
+                    params_dict = parameters
+                
+                # Also check OperationProperties for additional details
+                op_props = audit_data.get('OperationProperties', [])
+                if isinstance(op_props, list):
+                    for prop in op_props:
+                        if isinstance(prop, dict) and 'Name' in prop and 'Value' in prop:
+                            params_dict[prop['Name']] = prop['Value']
+                
+                # Extract specific fields
+                rule_details = {
+                    'timestamp': log_entry['timestamp'],
+                    'user': log_entry['user_id'],
+                    'operation': log_entry['operation'],
+                    'rule_name': params_dict.get('Name', audit_data.get('Name', '')),
+                    'rule_condition': params_dict.get('FromAddressContainsWords', 
+                                     params_dict.get('SubjectContainsWords',
+                                     params_dict.get('BodyContainsWords', ''))),
+                    'forward_to': params_dict.get('ForwardTo', ''),
+                    'forward_as_attachment': params_dict.get('ForwardAsAttachmentTo', ''),
+                    'redirect_to': params_dict.get('RedirectTo', ''),
+                    'delete_message': params_dict.get('DeleteMessage', ''),
+                    'move_to_folder': params_dict.get('MoveToFolder', ''),
+                    'mark_as_read': params_dict.get('MarkAsRead', ''),
+                    'client_ip': '',
+                    'session_id': '',
+                    'full_parameters': json.dumps(params_dict) if params_dict else ''
+                }
+                
+                # Extract IP and session
+                ips = list(self.extract_ip_addresses(log_entry))
+                sessions = self.extract_session_ids(log_entry)
+                rule_details['client_ip'] = ips[0] if ips else ''
+                rule_details['session_id'] = sessions.get('session_id', sessions.get('aad_session', ''))
+                
+                inbox_rules.append(rule_details)
+        
+        if not inbox_rules:
+            return
+        
+        csv_path = os.path.join(output_dir, 'ryoshi_inbox_rules.csv')
+        
+        with open(csv_path, 'w', newline='', encoding='utf-8') as f:
+            writer = csv.writer(f)
+            writer.writerow([
+                'Timestamp', 'User', 'Operation', 'RuleName', 'RuleCondition',
+                'ForwardTo', 'ForwardAsAttachment', 'RedirectTo', 'DeleteMessage',
+                'MoveToFolder', 'MarkAsRead', 'ClientIP', 'SessionID', 'FullParameters'
+            ])
+            
+            for rule in sorted(inbox_rules, key=lambda x: x['timestamp'], reverse=True):
+                # Clean timestamp
+                ts = rule['timestamp']
+                if ts.endswith('Z'):
+                    ts = ts[:-1]
+                if '.' in ts:
+                    ts = ts.split('.')[0]
+                
+                writer.writerow([
+                    ts,
+                    rule['user'],
+                    rule['operation'],
+                    rule['rule_name'],
+                    rule['rule_condition'],
+                    rule['forward_to'],
+                    rule['forward_as_attachment'],
+                    rule['redirect_to'],
+                    rule['delete_message'],
+                    rule['move_to_folder'],
+                    rule['mark_as_read'],
+                    rule['client_ip'],
+                    rule['session_id'],
+                    rule['full_parameters']
+                ])
+        
+        print(f"[+] Inbox rules CSV saved: {csv_path}")
+
+    def _save_detection_report_csv(self, output_dir, rule_findings):
+        """Save unified detection report as CSV.
+        
+        Generates one row per detection event across all rules and compromised users.
+        Columns:
+        - Line: Sequential number (1 to n)
+        - Timestamp: UTC timestamp of the detection
+        - Level: Rule severity (LOW, MEDIUM, HIGH, CRITICAL)
+        - User: Affected user
+        - Rule: Rule name/title
+        - Details: Context-specific information based on rule type
+        """
+        if not rule_findings:
+            return
+        
+        csv_path = os.path.join(output_dir, 'ryoshi_detections.csv')
+        
+        # Collect all detection rows
+        detection_rows = []
+        
+        for rule_id, rule_data in rule_findings.items():
+            rule_title = rule_data.get('title', rule_id)
+            severity = rule_data.get('severity', 'MEDIUM').upper()
+            samples = rule_data.get('samples', [])
+            
+            for match in samples:
+                timestamp = match.get('timestamp', '')
+                # Clean timestamp
+                if timestamp:
+                    if timestamp.endswith('Z'):
+                        timestamp = timestamp[:-1]
+                    if timestamp.endswith(' '):
+                        timestamp = timestamp.strip()
+                    if '.' in timestamp:
+                        timestamp = timestamp.split('.')[0]
+                
+                user = match.get('user', 'Unknown')
+                
+                # Build details based on rule type
+                details = self._build_detection_details(rule_id, match)
+                
+                detection_rows.append({
+                    'timestamp': timestamp,
+                    'level': severity,
+                    'user': user,
+                    'rule': rule_title,
+                    'details': details
+                })
+        
+        # Sort by timestamp (most recent first)
+        detection_rows.sort(key=lambda x: x.get('timestamp', ''), reverse=True)
+        
+        # Write CSV
+        with open(csv_path, 'w', newline='', encoding='utf-8') as f:
+            writer = csv.writer(f)
+            writer.writerow(['Line', 'Timestamp', 'Level', 'User', 'Rule', 'Details'])
+            
+            for idx, row in enumerate(detection_rows, 1):
+                writer.writerow([
+                    idx,
+                    row['timestamp'],
+                    row['level'],
+                    row['user'],
+                    row['rule'],
+                    row['details']
+                ])
+        
+        print(f"[+] Detection report CSV saved: {csv_path}")
+
+    def _build_detection_details(self, rule_id, match):
+        """Build context-specific details string for detection CSV.
+        
+        Formats details based on rule type:
+        - Token theft: Session ID, IPs, subnet count, countries
+        - Credential theft: Session count, IP count, event count
+        - Inbox rules: Rule name, forward/delete actions
+        - Email deletion: Operation details
+        - Other rules: IPs and operation info
+        """
+        details_parts = []
+        
+        rule_id_lower = rule_id.lower()
+        
+        # Token compromise / session hijacking
+        if 'token-compromise' in rule_id_lower or 'session-hijacking' in rule_id_lower:
+            session_id = match.get('session_id', '')
+            if session_id:
+                details_parts.append(f"SessionID: {session_id[:40]}")
+            
+            unique_ips = match.get('unique_ips', 0)
+            unique_subnets = match.get('unique_subnets_24', 0)
+            if unique_ips:
+                details_parts.append(f"IPs: {unique_ips}")
+            if unique_subnets:
+                details_parts.append(f"Subnets: {unique_subnets}")
+            
+            countries = match.get('countries', [])
+            if countries:
+                details_parts.append(f"Countries: {', '.join(countries)}")
+            
+            ips = match.get('ips', [])
+            if ips and len(ips) <= 5:
+                details_parts.append(f"IP List: {', '.join(ips[:5])}")
+            elif ips:
+                details_parts.append(f"IP List: {', '.join(ips[:5])}... (+{len(ips)-5} more)")
+        
+        # Credential theft / multiple sessions
+        elif 'credential-theft' in rule_id_lower or 'multiple-sessions' in rule_id_lower:
+            unique_sessions = match.get('unique_sessions', 0)
+            unique_ips = match.get('unique_ips', 0)
+            event_count = match.get('event_count', 0)
+            
+            if unique_sessions:
+                details_parts.append(f"Sessions: {unique_sessions}")
+            if unique_ips:
+                details_parts.append(f"IPs: {unique_ips}")
+            if event_count:
+                details_parts.append(f"Events: {event_count}")
+            
+            ips = match.get('ips', [])
+            if ips:
+                details_parts.append(f"IP List: {', '.join(ips[:5])}")
+                if len(ips) > 5:
+                    details_parts[-1] += f"... (+{len(ips)-5} more)"
+        
+        # Failed login then success
+        elif 'failed-login' in rule_id_lower or 'brute-force' in rule_id_lower:
+            failed_count = match.get('failed_count', 0)
+            first_failure = match.get('first_failure', '')
+            success_time = match.get('success_time', '')
+            
+            if failed_count:
+                details_parts.append(f"Failed attempts: {failed_count}")
+            if first_failure:
+                details_parts.append(f"First failure: {first_failure[:19]}")
+            if success_time:
+                details_parts.append(f"Success: {success_time[:19]}")
+        
+        # Inbox rule creation
+        elif 'inbox-rule' in rule_id_lower:
+            # Get details from the match - these might be in different formats
+            ips = match.get('ips', [])
+            if ips:
+                details_parts.append(f"IP: {ips[0] if ips else 'N/A'}")
+            
+            operation = match.get('operation', '')
+            if operation:
+                details_parts.append(f"Operation: {operation}")
+        
+        # Email deletion
+        elif 'email-deletion' in rule_id_lower or 'evidence-destruction' in rule_id_lower:
+            access_count = match.get('access_count', 0)
+            delete_count = match.get('delete_count', 0)
+            session_id = match.get('session_id', '')
+            
+            if session_id:
+                details_parts.append(f"SessionID: {session_id[:40]}")
+            if access_count:
+                details_parts.append(f"Accesses: {access_count}")
+            if delete_count:
+                details_parts.append(f"Deletions: {delete_count}")
+        
+        # SendAs / BEC
+        elif 'sendas' in rule_id_lower or 'bec' in rule_id_lower:
+            ips = match.get('ips', [])
+            operation = match.get('operation', '')
+            
+            if operation:
+                details_parts.append(f"Operation: {operation}")
+            if ips:
+                details_parts.append(f"IP: {', '.join(ips[:3])}")
+        
+        # Data exfiltration rules
+        elif 'exfiltration' in rule_id_lower or 'bulk' in rule_id_lower or 'mass' in rule_id_lower:
+            event_count = match.get('event_count', match.get('count', 0))
+            session_id = match.get('session_id', '')
+            
+            if session_id:
+                details_parts.append(f"SessionID: {session_id[:40]}")
+            if event_count:
+                details_parts.append(f"Events: {event_count}")
+            
+            ips = match.get('ips', [])
+            if ips:
+                details_parts.append(f"IP: {', '.join(ips[:3])}")
+        
+        # Default fallback for other rules
+        else:
+            operation = match.get('operation', '')
+            if operation:
+                details_parts.append(f"Operation: {operation}")
+            
+            ips = match.get('ips', [])
+            if ips:
+                details_parts.append(f"IPs: {', '.join(ips[:5])}")
+            
+            event_count = match.get('event_count', 0)
+            if event_count:
+                details_parts.append(f"Events: {event_count}")
+        
+        return ' | '.join(details_parts) if details_parts else 'No additional details'
 
     def _generate_html_report(self, output_dir, report, rule_findings):
         """Generate professional HTML detection report"""
@@ -2005,24 +2528,34 @@ class RyoshiDetectionEngine:
                 event_count = finding.get('event_count', 'N/A')
                 avg_abuse = finding.get('avg_abuse_score', 0)
                 
-                # Build IP table with reputation data
+                # Build IP table with reputation data (skip excluded IPs)
                 ip_table_rows = ''
                 for ip_info in ip_details[:15]:
+                    # Skip excluded country IPs from the table
+                    if ip_info.get('excluded'):
+                        continue
                     abuse_class = 'status-yes' if ip_info.get('abuse_score', 0) > 25 else ''
                     tor_badge = '<span class="risk-badge critical" style="font-size:10px;">TOR</span>' if ip_info.get('is_tor') else ''
                     proxy_badge = '<span class="risk-badge high" style="font-size:10px;">Proxy</span>' if ip_info.get('is_proxy') else ''
+                    country_display = ip_info.get('country', 'N/A') or 'N/A'
+                    city_display = ip_info.get('city', '') or ''
+                    abuse_score = ip_info.get('abuse_score', 0)
+                    abuse_display = f"{abuse_score}%" if abuse_score is not None else 'N/A'
                     ip_table_rows += f"""
                         <tr>
                             <td><code>{ip_info.get('ip', '')}</code></td>
-                            <td>{ip_info.get('country', 'Unknown')}</td>
-                            <td>{ip_info.get('city', '')}</td>
-                            <td class="{abuse_class}">{ip_info.get('abuse_score', 'N/A')}%</td>
+                            <td>{country_display}</td>
+                            <td>{city_display}</td>
+                            <td class="{abuse_class}">{abuse_display}</td>
                             <td>{tor_badge} {proxy_badge}</td>
                         </tr>"""
                 
                 # Determine risk level
                 risk_level = 'critical' if (len(countries) > 2 or avg_abuse > 30 or len(suspicious_ips) > 3) else 'high'
                 risk_text = 'CRITICAL - Multi-Country' if finding.get('multi_country') else 'HIGH - Subnet Diversity'
+                
+                # Build countries display - handle empty list (excluded countries not shown)
+                countries_display = ', '.join(countries) if countries else 'Single Country'
                 
                 html_content += f"""
             <div class="finding-card {'critical' if risk_level == 'critical' else 'warning'}">
@@ -2036,7 +2569,7 @@ class RyoshiDetectionEngine:
                         <tr><td>Users</td><td><strong>{finding.get('user', 'Unknown')}</strong></td></tr>
                         <tr><td>Unique IPs</td><td><strong>{unique_ips}</strong></td></tr>
                         <tr><td>Unique /24 Subnets</td><td><strong>{unique_subnets}</strong></td></tr>
-                        <tr><td>Countries</td><td><strong>{', '.join(countries) if countries else 'Checking...'}</strong></td></tr>
+                        <tr><td>Countries</td><td><strong>{countries_display}</strong></td></tr>
                         <tr><td>Suspicious IPs (AbuseIPDB)</td><td class="{'status-yes' if suspicious_ips else ''}">{len(suspicious_ips)}</td></tr>
                         <tr><td>Avg. Abuse Score</td><td>{avg_abuse:.1f}%</td></tr>
                         <tr><td>Events</td><td>{event_count}</td></tr>
@@ -2408,7 +2941,7 @@ Examples:
         action='append',
         dest='exclude_countries',
         metavar='COUNTRY',
-        help='Exclude IPs from this country in token theft detection (can be used multiple times). Example: --exclude-country=Spain --exclude-country=France'
+        help='Exclude IPs from specified countries in token theft detection. Supports comma-separated values. Examples: --exclude-country=ES,FR or --exclude-country="Spain,France"'
     )
     
     args = parser.parse_args()
@@ -2427,12 +2960,12 @@ Examples:
         print("[*] AbuseIPDB integration disabled (no API key provided)")
         print("    Use --abuseipdb-key or set ABUSEIPDB_API_KEY environment variable")
     
-    # Check for excluded countries
-    if args.exclude_countries:
-        print(f"[+] Excluding countries from token theft detection: {', '.join(args.exclude_countries)}")
-    
     # Initialize engine with rules directory, API key, and excluded countries
     engine = RyoshiDetectionEngine(rules_dir=args.rules_dir, abuseipdb_key=abuseipdb_key, exclude_countries=args.exclude_countries)
+    
+    # Display excluded countries after normalization
+    if engine.exclude_countries:
+        print(f"[+] Excluding countries from token theft detection: {', '.join(sorted(c.upper() for c in engine.exclude_countries))}")
     
     if args.files:
         for filepath in args.files:

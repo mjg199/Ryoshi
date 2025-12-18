@@ -104,12 +104,23 @@ When enabled, the engine will:
 Filter out known legitimate locations to reduce false positives:
 
 ```bash
-# Exclude single country (e.g., Spain)
+# Exclude single country using ISO code
+python3 engine/ryoshi-detection-engine.py -f audit.csv --exclude-country="ES"
+
+# Exclude single country using full name
 python3 engine/ryoshi-detection-engine.py -f audit.csv --exclude-country="Spain"
 
-# Exclude multiple countries (comma-separated)
-python3 engine/ryoshi-detection-engine.py -f audit.csv --exclude-country="Spain,France,Germany"
+# Exclude multiple countries (comma-separated ISO codes)
+python3 engine/ryoshi-detection-engine.py -f audit.csv --exclude-country="ES,FR,DE"
+
+# Exclude multiple countries (comma-separated names)
+python3 engine/ryoshi-detection-engine.py -f audit.csv --exclude-country="Spain, France, Germany"
+
+# Mixed format also works
+python3 engine/ryoshi-detection-engine.py -f audit.csv --exclude-country="ES, France, DE"
 ```
+
+**Supported countries include:** Spain (ES), France (FR), Germany (DE), United States (US), United Kingdom (GB), Italy (IT), Portugal (PT), Netherlands (NL), Belgium (BE), Switzerland (CH), Austria (AT), Poland (PL), Sweden (SE), Norway (NO), Denmark (DK), Finland (FI), Ireland (IE), Canada (CA), Australia (AU), Japan (JP), China (CN), India (IN), Brazil (BR), Mexico (MX), and 40+ more.
 
 This is useful when:
 - Organization is primarily based in specific countries
@@ -118,12 +129,26 @@ This is useful when:
 
 ### Output
 
-The engine generates:
-- **Output** The default output directory is saved to `/tmp/ryoshi_detection_report.json` you can change it by using the -o flag
-- **Console Summary**: Detection counts by severity and type
-- **JSON Report**: Detailed findings 
-- **HTML Report**: Interactive detection dashboard with IP reputation data
-- **Timeline Reports**: Activity timelines for compromised users (JSON & CSV)
+The engine generates multiple report formats:
+
+**Reports (per analysis)**
+- **JSON Report** (`ryoshi_detection_report.json`): Detailed findings with all detection data
+- **HTML Report** (`ryoshi_detection_report.html`): Interactive dashboard with IP geolocation and reputation data
+- **Markdown Report** (`ryoshi_detection_report.md`): Text-based summary for documentation
+
+**CSV Exports**
+- **Detection Report** (`ryoshi_detections.csv`): Unified detection log with columns: Line, Timestamp, Level, User, Rule, Details
+- **Suspicious Sessions** (`ryoshi_suspicious_sessions.csv`): Mapping of compromised users to their session IDs
+- **Session IPs** (`ryoshi_session_ips.csv`): All IPs observed per session ID
+- **Inbox Rules** (`ryoshi_inbox_rules.csv`): Details of inbox rules created/modified (RuleName, RuleId, RuleActions, etc.)
+- **All IPs** (`ryoshi_all_ips.csv`): Complete IP address list with geolocation
+- **All Sessions** (`ryoshi_all_sessions.csv`): Session ID inventory
+
+**Timeline Reports (per compromised user)**
+- **JSON Timeline** (`ryoshi_timeline_{user}.json`): Detailed activity timeline
+- **CSV Timeline** (`ryoshi_timeline_{user}.csv`): Tabular activity timeline
+
+Use `-o /path/to/output/` to change the output directory (default: `/tmp/`).
 
 Example output:
 ```
@@ -212,6 +237,12 @@ The token hijacking rule uses a **hybrid multi-layer approach**:
 - ✅ **Recursive loading** - Scans all subdirectories for `*.yaml` files
 - ✅ **Custom paths** - Use `--rules-dir` to override default location
 
+### Two-Phase Rule Execution
+- ✅ **Phase 1 - Compromise Detection**: Runs token theft and credential theft rules first
+- ✅ **Phase 2 - Secondary Analysis**: Runs remaining rules only against compromised accounts
+- ✅ **Performance optimized** - Skips analyzing non-compromised users in Phase 2
+- ✅ **Reduced false positives** - Focuses secondary detections on confirmed compromises
+
 ### Token Compromise Detection
 - ✅ **Subnet diversity analysis** - 3+ /24 subnets required
 - ✅ **Geolocation checking** - Detects impossible travel via ip-api.com
@@ -231,6 +262,8 @@ The token hijacking rule uses a **hybrid multi-layer approach**:
 - ✅ **Timeline building** - Creates activity timelines for compromised users (JSON & CSV)
 - ✅ **Severity classification** - CRITICAL, HIGH, MEDIUM categorization
 - ✅ **HTML reporting** - Interactive dashboard with IP reputation data
+- ✅ **Unified detection CSV** - All detections in single CSV with context-specific details
+- ✅ **Session analysis CSVs** - Suspicious sessions, session-to-IP mappings, inbox rules
 
 ## 📋 Log Format Requirements
 
@@ -256,17 +289,21 @@ Example AuditData fields parsed:
 - ✅ Python detection engine with hybrid rule-based architecture
 - ✅ 9 YAML detection rules covering major M365 attack patterns
 - ✅ Automatic rule discovery and loading from `rules/` folder
+- ✅ **Two-phase rule execution** for optimized performance
 - ✅ Token compromise detection with subnet diversity analysis
 - ✅ IP geolocation (ip-api.com) for impossible travel detection
 - ✅ AbuseIPDB API integration for IP reputation checking
-- ✅ Country exclusion filtering to reduce false positives
+- ✅ **Country exclusion with ISO codes and full names** (40+ countries supported)
+- ✅ **Comma-separated country values** (e.g., "ES,FR,DE" or "Spain, France")
 - ✅ Activity timeline generation for compromised users (JSON & CSV)
-- ✅ Multi-format reporting (JSON, HTML, Markdown, CSV)
+- ✅ **Unified detection CSV** with context-specific details per rule type
+- ✅ **Session analysis CSVs** (suspicious sessions, session IPs, inbox rules)
+- ✅ Multi-format reporting (JSON, HTML, Markdown, 7+ CSV files)
 - ✅ CSV parsing for M365 Unified Audit Logs
 - ✅ JSON report generation with detailed findings
-- ✅ Activity timeline building for compromised users
 - ✅ IP and session tracking across logs
 - ✅ KMSI persistence detection
+- ✅ **Microsoft/Azure IP detection** for cloud service identification
 
 ## 🔗 References
 
