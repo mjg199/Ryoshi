@@ -57,9 +57,19 @@ pip install pyyaml
 pip install requests  # Optional: for IP geolocation and reputation checks
 ```
 
+### Input Data
+
+Ryoshi is designed to analyze CSV export files from Microsoft Purview's **eDiscovery Audit Log** function. To export audit logs:
+
+1. Open **Microsoft Purview** → **eDiscovery**
+2. Navigate to **Audit** and configure your search criteria (date range, mailboxes, operation types, etc.)
+3. Export results as **CSV format** — this creates an audit export file with the schema Ryoshi expects
+
+The CSV file must contain standard M365 audit log fields: RecordId, CreationDate, RecordType, Operation, UserId, AuditData, and AssociatedAdminUnits.
+
 ### Basic Usage
 
-Analyze M365 audit logs (CSV format) using all loaded rules:
+Analyze M365 audit logs (CSV format from Purview eDiscovery) using all loaded rules:
 
 ```bash
 # Single file analysis (rules auto-loaded from ./rules/)
@@ -85,16 +95,16 @@ python3 engine/ryoshi-detection-engine.py -f audit.csv -o /path/to/output/
 Enable IP reputation analysis for token theft detection:
 
 ```bash
-# Using command-line argument
-python3 engine/ryoshi-detection-engine.py -f audit.csv --abuseipdb-key YOUR_API_KEY
-
-# Using environment variable
+# Recommended: using environment variable (avoids exposing key in shell history)
 export ABUSEIPDB_API_KEY="your_api_key_here"
 python3 engine/ryoshi-detection-engine.py -f audit.csv
+
+# Alternative: using command-line argument (⚠️ key visible in process listings)
+python3 engine/ryoshi-detection-engine.py -f audit.csv --abuseipdb-key YOUR_API_KEY
 ```
 
 When enabled, the engine will:
-- Query AbuseIPDB for IP abuse scores
+- Query AbuseIPDB for IP abuse scores (HTTPS only)
 - Flag known TOR and proxy exit nodes
 - Include reputation data in HTML reports
 - Reduce false positives from known malicious infrastructure
