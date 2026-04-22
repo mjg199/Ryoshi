@@ -13,9 +13,8 @@ import csv
 import json
 import argparse
 import os
-import sys
 import glob
-import html as html_module
+import ipaddress
 from datetime import datetime, timedelta
 from collections import defaultdict
 import re
@@ -35,9 +34,6 @@ except ImportError:
     requests = None
 
 
-# Increase CSV field size limit to handle large AuditData JSON fields in M365 logs
-csv.field_size_limit(sys.maxsize)
-
 # AbuseIPDB Configuration
 ABUSEIPDB_API_KEY = os.environ.get('ABUSEIPDB_API_KEY', '')  # Set via environment variable
 ABUSEIPDB_CACHE = {}  # Cache to avoid repeated API calls
@@ -52,24 +48,58 @@ def ip_to_int(ip):
 
 
 def get_subnet_24(ip):
-    """Extract /24 subnet from IP address"""
+    """Extract network prefix (/24 for IPv4, /64 for IPv6)."""
     try:
-        parts = ip.split('.')
-        if len(parts) == 4:
-            return f"{parts[0]}.{parts[1]}.{parts[2]}.0/24"
+        ip_obj = ipaddress.ip_address(ip)
+        if ip_obj.version == 4:
+            return str(ipaddress.ip_network(f"{ip_obj}/24", strict=False))
+        return str(ipaddress.ip_network(f"{ip_obj}/64", strict=False))
     except:
         pass
     return None
 
 
 def get_subnet_16(ip):
-    """Extract /16 subnet from IP address"""
+    """Extract broader network prefix (/16 for IPv4, /48 for IPv6)."""
     try:
-        parts = ip.split('.')
-        if len(parts) == 4:
-            return f"{parts[0]}.{parts[1]}.0.0/16"
+        ip_obj = ipaddress.ip_address(ip)
+        if ip_obj.version == 4:
+            return str(ipaddress.ip_network(f"{ip_obj}/16", strict=False))
+        return str(ipaddress.ip_network(f"{ip_obj}/48", strict=False))
     except:
         pass
+    return None
+
+
+def normalize_ip_address(ip_value):
+    """Normalize and validate IPv4/IPv6 addresses, handling common port formats."""
+    if ip_value is None:
+        return None
+
+    candidate = str(ip_value).strip()
+    if not candidate:
+        return None
+
+    bracket_match = re.match(r'^\[([^\]]+)\](?::\d+)?$', candidate)
+    if bracket_match:
+        candidate = bracket_match.group(1)
+
+    if '%' in candidate:
+        candidate = candidate.split('%', 1)[0]
+
+    try:
+        return str(ipaddress.ip_address(candidate))
+    except ValueError:
+        pass
+
+    if candidate.count(':') == 1 and candidate.split(':', 1)[0].count('.') == 3:
+        host, port = candidate.rsplit(':', 1)
+        if port.isdigit():
+            try:
+                return str(ipaddress.ip_address(host))
+            except ValueError:
+                return None
+
     return None
 
 
@@ -128,53 +158,32 @@ def check_abuseipdb(ip, api_key=None):
     return None
 
 
-# Geolocation cache to avoid repeated lookups
-_GEOLOCATION_CACHE = {}
-
 def get_ip_geolocation(ip):
-    """Get IP geolocation using HTTPS-only ipwho.is service.
-    
-    Uses HTTPS to prevent leaking investigated IP addresses over plaintext.
-    Results are cached to minimize external API calls.
-    """
+    """Get IP geolocation using free ip-api.com service"""
     if not requests:
         return None
-    
-    # Skip private/reserved IPs
-    if ip.startswith(('10.', '192.168.', '172.16.', '172.17.', '172.18.', '172.19.',
-                       '172.20.', '172.21.', '172.22.', '172.23.', '172.24.', '172.25.',
-                       '172.26.', '172.27.', '172.28.', '172.29.', '172.30.', '172.31.',
-                       '127.', '169.254.', '0.', '100.64.', '100.65.', '100.66.',
-                       '100.67.', '100.68.', '100.69.', '100.7')):
-        return {'country': 'Private', 'countryCode': 'PRIV', 'city': 'Private', 'lat': 0, 'lon': 0, 'isp': 'Private'}
-    
-    # Check cache
-    if ip in _GEOLOCATION_CACHE:
-        return _GEOLOCATION_CACHE[ip]
-    
+
+    normalized_ip = normalize_ip_address(ip)
+    if not normalized_ip:
+        return None
+
     try:
-        response = requests.get(f'https://ipwho.is/{ip}', timeout=5, verify=True)
+        ip_obj = ipaddress.ip_address(normalized_ip)
+        if (ip_obj.is_private or ip_obj.is_loopback or ip_obj.is_link_local or
+                ip_obj.is_multicast or ip_obj.is_reserved or ip_obj.is_unspecified):
+            return {'country': 'Private', 'countryCode': 'PRIV', 'city': 'Private', 'lat': 0, 'lon': 0}
+    except ValueError:
+        return None
+
+    try:
+        response = requests.get(f'http://ip-api.com/json/{normalized_ip}?fields=status,country,countryCode,city,lat,lon,isp,org', timeout=3)
         if response.status_code == 200:
             data = response.json()
-            if data.get('success', False):
-                result = {
-                    'country': data.get('country', ''),
-                    'countryCode': data.get('country_code', ''),
-                    'city': data.get('city', ''),
-                    'lat': data.get('latitude', 0),
-                    'lon': data.get('longitude', 0),
-                    'isp': data.get('connection', {}).get('isp', ''),
-                    'org': data.get('connection', {}).get('org', '')
-                }
-                _GEOLOCATION_CACHE[ip] = result
-                return result
-    except requests.exceptions.SSLError as e:
-        print(f"    [!] Geolocation SSL error for {ip}: {str(e)[:50]}")
-    except requests.exceptions.Timeout:
-        print(f"    [!] Geolocation timeout for {ip}")
-    except Exception:
+            if data.get('status') == 'success':
+                return data
+    except:
         pass
-    
+
     return None
 
 
@@ -348,19 +357,18 @@ class RyoshiDetectionEngine:
         return total
 
     def extract_ip_addresses(self, log_entry):
-        """Extract IP addresses from various fields"""
+        """Extract normalized IPv4/IPv6 addresses from various fields"""
         ips = set()
         audit = log_entry.get('audit_data', {})
         
         for field in ['ClientIP', 'ClientIPAddress', 'ActorIpAddress']:
             if field in audit and audit[field]:
-                ip = audit[field]
-                if ':' in ip and not ip.startswith('['):
-                    ip = ip.split(':')[0]
-                if ip.startswith('['):
-                    ip = ip.strip('[]').split(']')[0]
-                if re.match(r'^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$', ip):
-                    ips.add(ip)
+                raw_value = audit[field]
+                values = raw_value if isinstance(raw_value, list) else [raw_value]
+                for value in values:
+                    normalized_ip = normalize_ip_address(value)
+                    if normalized_ip:
+                        ips.add(normalized_ip)
         
         return ips
 
@@ -642,7 +650,12 @@ class RyoshiDetectionEngine:
         required_result = filter_criteria.get('result_status')
         
         # Group logins by user
-        user_data = defaultdict(lambda: {'sessions': set(), 'ips': set(), 'events': []})
+        user_data = defaultdict(lambda: {
+            'sessions': set(),
+            'ips': set(),
+            'events': [],
+            'ip_countries': defaultdict(set)
+        })
         
         for log_entry in self.logs:
             if self._matches_selection(log_entry, selection, ops_to_match):
@@ -654,8 +667,12 @@ class RyoshiDetectionEngine:
                 user = log_entry['user_id']
                 ips = self.extract_ip_addresses(log_entry)
                 sessions = self.extract_session_ids(log_entry)
+                country_hint = self._extract_country_hint(audit)
                 
                 user_data[user]['ips'].update(ips)
+                if country_hint:
+                    for ip in ips:
+                        user_data[user]['ip_countries'][ip].add(country_hint)
                 for sid_type, sid in sessions.items():
                     if sid:
                         user_data[user]['sessions'].add(sid)
@@ -669,82 +686,24 @@ class RyoshiDetectionEngine:
         requirements = correlation.get('requirements', {})
         min_sessions = self._parse_requirement(requirements.get('unique_sessions', '>=1'))
         min_ips = self._parse_requirement(requirements.get('unique_ips', '>=1'))
-        min_countries = self._parse_requirement(requirements.get('unique_countries', '>=0'))
-        require_countries = min_countries > 0
-        
-        if require_countries:
-            print(f"\n[*] Hybrid detection enabled: requiring {min_countries}+ countries per user")
+        min_countries = self._parse_requirement(requirements.get('unique_countries', '>=1'))
         
         matches = []
         for user, data in user_data.items():
-            # Baseline filter: minimum sessions and IPs
-            if len(data['sessions']) < min_sessions or len(data['ips']) < min_ips:
-                continue
-            
-            # If multi-country requirement is set, perform geolocation enrichment
-            if require_countries:
-                countries = set()
-                ip_details = []
-                excluded_ips = []
-                
-                for ip in list(data['ips'])[:20]:  # Limit for performance
-                    ip_info = {'ip': ip, 'country': 'N/A', 'countryCode': '', 'excluded': False}
-                    
-                    geo = get_ip_geolocation(ip)
-                    if geo:
-                        ip_info['country'] = geo.get('country', 'N/A') or 'N/A'
-                        ip_info['countryCode'] = geo.get('countryCode', '')
-                        ip_info['city'] = geo.get('city', '')
-                        ip_info['isp'] = geo.get('isp', '')
-                        
-                        # Check country exclusion list
-                        country_code = geo.get('countryCode', '').lower()
-                        country_name = geo.get('country', '').lower()
-                        is_excluded = (country_code in self.exclude_countries or
-                                       country_name in self.exclude_countries or
-                                       self.country_name_to_code.get(country_name, '') in self.exclude_countries)
-                        if is_excluded:
-                            ip_info['excluded'] = True
-                            excluded_ips.append(ip)
-                        else:
-                            countries.add(geo.get('countryCode', 'N/A'))
-                        
-                        self.ip_geolocation[ip] = geo
-                    
-                    ip_details.append(ip_info)
-                
-                # Skip if all IPs are from excluded countries
-                non_excluded_ips = [ip for ip in ip_details if not ip.get('excluded', False)]
-                if len(non_excluded_ips) == 0:
+            countries = set()
+            for ip in data['ips']:
+                hinted = data['ip_countries'].get(ip, set())
+                if hinted:
+                    countries.update(hinted)
                     continue
-                
-                # Check multi-country requirement
-                if len(countries) < min_countries:
-                    continue
-                
-                # Build detection reasons
-                detection_reasons = []
-                detection_reasons.append(f"Multi-country access ({', '.join(countries)})")
-                detection_reasons.append(f"{len(data['sessions'])} sessions from {len(data['ips'])} IPs")
-                if excluded_ips:
-                    detection_reasons.append(f"{len(excluded_ips)} IPs from allowed countries excluded")
-                
-                matches.append({
-                    'timestamp': data['events'][0]['timestamp'] if data['events'] else '',
-                    'user': user,
-                    'operation': 'Credential Theft Detected',
-                    'ips': list(data['ips']),
-                    'unique_sessions': len(data['sessions']),
-                    'unique_ips': len(data['ips']),
-                    'unique_countries': len(countries),
-                    'countries': list(countries),
-                    'excluded_ip_count': len(excluded_ips),
-                    'ip_details': ip_details,
-                    'detection_reasons': detection_reasons,
-                    'event_count': len(data['events'])
-                })
-            else:
-                # Simple correlation (no geolocation required)
+
+                resolved_country = self._resolve_ip_country(ip)
+                if resolved_country:
+                    countries.add(resolved_country)
+
+            if (len(data['sessions']) >= min_sessions and
+                    len(data['ips']) >= min_ips and
+                    len(countries) >= min_countries):
                 matches.append({
                     'timestamp': data['events'][0]['timestamp'] if data['events'] else '',
                     'user': user,
@@ -752,6 +711,8 @@ class RyoshiDetectionEngine:
                     'ips': list(data['ips']),
                     'unique_sessions': len(data['sessions']),
                     'unique_ips': len(data['ips']),
+                    'unique_countries': len(countries),
+                    'countries': sorted(countries),
                     'event_count': len(data['events'])
                 })
         
@@ -769,12 +730,47 @@ class RyoshiDetectionEngine:
             print(f"\n[!] {rule_title}")
             print(f"    Severity: {severity} | Users Affected: {len(matches)}")
             for m in matches[:2]:
-                if require_countries:
-                    print(f"    - {m['user']}: {m['unique_sessions']} sessions, {m['unique_ips']} IPs, countries: {', '.join(m.get('countries', []))}")
-                    if m.get('excluded_ip_count', 0) > 0:
-                        print(f"      ({m['excluded_ip_count']} IPs from allowed countries excluded)")
-                else:
-                    print(f"    - {m['user']}: {m['unique_sessions']} sessions, {m['unique_ips']} IPs")
+                print(f"    - {m['user']}: {m['unique_sessions']} sessions, {m['unique_ips']} IPs, {m.get('unique_countries', 0)} countries")
+
+    def _extract_country_hint(self, audit):
+        """Extract country hint (ISO-2) from audit payload when available."""
+        if not isinstance(audit, dict):
+            return None
+
+        for key in ['Country', 'CountryCode', 'country', 'countryCode']:
+            value = audit.get(key)
+            if isinstance(value, str):
+                code = value.strip().upper()
+                if len(code) == 2 and code.isalpha():
+                    return code
+
+        geo_location = audit.get('GeoLocation')
+        if isinstance(geo_location, str):
+            code = geo_location.strip().upper()
+            if len(code) == 2 and code.isalpha():
+                return code
+
+        return None
+
+    def _resolve_ip_country(self, ip):
+        """Resolve country code for an IP using cache + geolocation lookup."""
+        if not ip:
+            return None
+
+        geo = self.ip_geolocation.get(ip)
+        if not geo:
+            geo = get_ip_geolocation(ip)
+            if geo:
+                self.ip_geolocation[ip] = geo
+
+        if not geo:
+            return None
+
+        country_code = str(geo.get('countryCode', '')).strip().upper()
+        if len(country_code) == 2 and country_code.isalpha():
+            return country_code
+
+        return None
     
     def _execute_sequence_rule(self, rule_id, rule):
         """Execute sequence correlation rule - detect patterns like failed then success"""
@@ -826,7 +822,8 @@ class RyoshiDetectionEngine:
                 user_events[user]['success'].append({
                     'timestamp': timestamp,
                     'ips': list(self.extract_ip_addresses(log_entry)),
-                    'raw_ts': log_entry['timestamp']
+                    'raw_ts': log_entry['timestamp'],
+                    'sessions': self.extract_session_ids(log_entry)
                 })
         
         # Check for pattern: multiple failures followed by success within timeframe
@@ -846,6 +843,7 @@ class RyoshiDetectionEngine:
                                    if success['timestamp'] - timedelta(hours=1) <= f['timestamp'] < success['timestamp']]
                 
                 if len(failures_before) >= min_failures:
+                    success_sessions = [sid for sid in success.get('sessions', {}).values() if sid]
                     matches.append({
                         'timestamp': success['raw_ts'],
                         'user': user,
@@ -853,7 +851,10 @@ class RyoshiDetectionEngine:
                         'ips': success['ips'],
                         'failed_count': len(failures_before),
                         'first_failure': failures_before[0]['raw_ts'] if failures_before else '',
-                        'success_time': success['raw_ts']
+                        'last_failure': failures_before[-1]['raw_ts'] if failures_before else '',
+                        'success_time': success['raw_ts'],
+                        'success_date': success['raw_ts'][:10],
+                        'success_sessions': success_sessions
                     })
                     break  # One match per user
         
@@ -875,7 +876,7 @@ class RyoshiDetectionEngine:
     
     def _execute_session_rule(self, rule_id, rule):
         """Execute session correlation rule with hybrid detection:
-        1. Subnet diversity (3+ /24 subnets)
+        1. Network-prefix diversity (3+ /24 IPv4 or /64 IPv6 prefixes)
         2. Geolocation impossible travel
         3. AbuseIPDB reputation check
         """
@@ -1013,7 +1014,7 @@ class RyoshiDetectionEngine:
             # Determine detection reason
             detection_reasons = []
             if len(non_excluded_subnets) >= min_subnets:
-                detection_reasons.append(f"{len(non_excluded_subnets)} distinct /24 subnets (excl. {len(excluded_ips)} IPs from allowed countries)")
+                detection_reasons.append(f"{len(non_excluded_subnets)} distinct network prefixes (/24 IPv4 or /64 IPv6, excl. {len(excluded_ips)} IPs from allowed countries)")
             if multi_country:
                 detection_reasons.append(f"Multi-country access ({', '.join(countries)})")
             if has_suspicious_ips:
@@ -1068,7 +1069,7 @@ class RyoshiDetectionEngine:
             print(f"    Severity: {severity} | Sessions Affected: {len(matches)}")
             for m in matches[:3]:
                 reasons = ', '.join(m.get('detection_reasons', []))
-                print(f"    - Session {m['session_id'][:20]}...: {m['unique_ips']} IPs, {m['unique_subnets_24']} subnets")
+                print(f"    - Session {m['session_id']}: {m['unique_ips']} IPs, {m['unique_subnets_24']} subnets")
                 print(f"      Countries: {', '.join(m.get('countries', []))}")
                 if m.get('suspicious_ips'):
                     print(f"      Suspicious IPs: {len(m['suspicious_ips'])}")
@@ -1457,20 +1458,12 @@ class RyoshiDetectionEngine:
             return details[0]
         return 'no_detail'
 
-    def generate_report(self, output_dir='./ryoshi_output'):
-        """Generate detection and timeline reports (JSON, HTML, Markdown).
-        
-        Reports contain sensitive data (PII, IPs, session IDs, email subjects).
-        Output directory permissions are restricted to owner-only on supported platforms.
-        """
+    def generate_report(self, output_dir='/tmp'):
+        """Generate detection and timeline reports (JSON, HTML, Markdown)"""
         print(f"\n[*] Generating reports to {output_dir}...")
         
-        # Ensure output directory exists with restricted permissions
+        # Ensure output directory exists
         os.makedirs(output_dir, exist_ok=True)
-        try:
-            os.chmod(output_dir, 0o700)  # Owner read/write/execute only
-        except OSError:
-            pass  # Windows may not support chmod; permissions managed by ACLs
         
         # Count rule detections by severity
         rule_findings = {}
@@ -1883,7 +1876,7 @@ class RyoshiDetectionEngine:
         if 'token-compromise' in rule_id_lower or 'session-hijacking' in rule_id_lower:
             session_id = match.get('session_id', '')
             if session_id:
-                details_parts.append(f"SessionID: {session_id[:40]}")
+                details_parts.append(f"SessionID: {session_id}")
             
             unique_ips = match.get('unique_ips', 0)
             unique_subnets = match.get('unique_subnets_24', 0)
@@ -1952,7 +1945,7 @@ class RyoshiDetectionEngine:
             session_id = match.get('session_id', '')
             
             if session_id:
-                details_parts.append(f"SessionID: {session_id[:40]}")
+                details_parts.append(f"SessionID: {session_id}")
             if access_count:
                 details_parts.append(f"Accesses: {access_count}")
             if delete_count:
@@ -1974,7 +1967,7 @@ class RyoshiDetectionEngine:
             session_id = match.get('session_id', '')
             
             if session_id:
-                details_parts.append(f"SessionID: {session_id[:40]}")
+                details_parts.append(f"SessionID: {session_id}")
             if event_count:
                 details_parts.append(f"Events: {event_count}")
             
@@ -1998,18 +1991,8 @@ class RyoshiDetectionEngine:
         
         return ' | '.join(details_parts) if details_parts else 'No additional details'
 
-    @staticmethod
-    def _h(value):
-        """HTML-escape a value to prevent XSS in generated reports.
-        
-        All user-controlled data (usernames, IPs, email subjects, operation names,
-        session IDs) must be escaped before insertion into HTML output.
-        """
-        return html_module.escape(str(value)) if value else ''
-
     def _generate_html_report(self, output_dir, report, rule_findings):
         """Generate professional HTML detection report"""
-        h = self._h  # Shorthand for HTML escaping
         
         # Count severities
         critical_count = sum(1 for d in self.rule_detections.values() if d['severity'] == 'CRITICAL' and d['count'] > 0)
@@ -2568,6 +2551,12 @@ class RyoshiDetectionEngine:
         for rule_id, data in self.rule_detections.items():
             if data['count'] > 0 and 'credential-theft' in rule_id:
                 rule_credential_theft.extend(data['matches'])
+
+        # Get failed login -> success findings (suspicious successful logins)
+        rule_failed_then_success = []
+        for rule_id, data in self.rule_detections.items():
+            if data['count'] > 0 and ('failed-then-success' in rule_id or 'failed-login' in rule_id):
+                rule_failed_then_success.extend(data['matches'])
         
         # Get rule-based token compromise findings
         rule_token_compromise = []
@@ -2576,7 +2565,7 @@ class RyoshiDetectionEngine:
                 rule_token_compromise.extend(data['matches'])
         
         # Calculate totals
-        total_credential_theft = len(rule_credential_theft)
+        total_credential_theft = len(rule_credential_theft) + len(rule_failed_then_success)
         total_token_compromise = len(rule_token_compromise)
         
         html_content += f"""
@@ -2592,83 +2581,123 @@ class RyoshiDetectionEngine:
         if rule_credential_theft:
             for finding in rule_credential_theft:
                 ip_list = finding.get('ips', [])
-                ip_details = finding.get('ip_details', [])
-                countries = finding.get('countries', [])
-                detection_reasons = finding.get('detection_reasons', [])
-                
-                ip_tags = ''.join([f'<span class="ip-tag">{h(ip)}</span>' for ip in ip_list[:10]])
+                ip_tags = ''.join([f'<span class="ip-tag">{ip}</span>' for ip in ip_list[:10]])
                 if len(ip_list) > 10:
                     ip_tags += f'<span class="ip-tag">+{len(ip_list) - 10} more</span>'
+
+                country_codes = set(finding.get('countries', []))
+                credential_ip_rows = ''
+                for ip in ip_list[:15]:
+                    country_code = self._resolve_ip_country(ip) or 'N/A'
+                    if country_code != 'N/A':
+                        country_codes.add(country_code)
+
+                    abuse_info = self.ip_reputation.get(ip)
+                    if abuse_info is None and self.abuseipdb_key:
+                        abuse_info = check_abuseipdb(ip, self.abuseipdb_key)
+                        if abuse_info:
+                            self.ip_reputation[ip] = abuse_info
+
+                    if abuse_info:
+                        abuse_score = abuse_info.get('abuse_confidence', 0)
+                        ip_score = f"{abuse_score}%"
+                    else:
+                        ip_score = 'N/A'
+
+                    credential_ip_rows += f"""
+                        <tr>
+                            <td><code>{ip}</code></td>
+                            <td>{country_code}</td>
+                            <td>{ip_score}</td>
+                        </tr>"""
+
+                if not credential_ip_rows:
+                    credential_ip_rows = """
+                        <tr>
+                            <td colspan=\"3\">No IP details available</td>
+                        </tr>"""
+
+                countries_display = ', '.join(sorted(country_codes)) if country_codes else 'N/A'
                 
                 unique_sessions = finding.get('unique_sessions', 'N/A')
                 unique_ips = finding.get('unique_ips', len(ip_list))
-                unique_countries = finding.get('unique_countries', len(countries))
                 event_count = finding.get('event_count', 'N/A')
-                excluded_ip_count = finding.get('excluded_ip_count', 0)
                 timestamp = finding.get('timestamp', '')[:19].replace('T', ' ')
-                countries_display = h(', '.join(countries)) if countries else 'N/A'
-                
-                # Build IP reputation table rows (same format as token compromise)
-                cred_ip_table_rows = ''
-                for ip_info in ip_details[:15]:
-                    if ip_info.get('excluded'):
-                        continue
-                    abuse_class = 'status-yes' if ip_info.get('abuse_score', 0) > 25 else ''
-                    tor_badge = '<span class="risk-badge critical" style="font-size:10px;">TOR</span>' if ip_info.get('is_tor') else ''
-                    proxy_badge = '<span class="risk-badge high" style="font-size:10px;">Proxy</span>' if ip_info.get('is_proxy') else ''
-                    country_display = h(ip_info.get('country', 'N/A') or 'N/A')
-                    city_display = h(ip_info.get('city', '') or '')
-                    abuse_score = ip_info.get('abuse_score', 0)
-                    abuse_display = f"{abuse_score}%" if abuse_score is not None else 'N/A'
-                    cred_ip_table_rows += f"""
-                        <tr>
-                            <td><code>{h(ip_info.get('ip', ''))}</code></td>
-                            <td>{country_display}</td>
-                            <td>{city_display}</td>
-                            <td class="{abuse_class}">{abuse_display}</td>
-                            <td>{tor_badge} {proxy_badge}</td>
-                        </tr>"""
                 
                 html_content += f"""
             <div class="finding-card critical">
                 <div class="finding-header">
-                    <span class="finding-title">{h(finding.get('user', 'Unknown'))}</span>
-                    <span class="risk-badge critical">Critical - Multi-Country</span>
+                    <span class="finding-title">{finding.get('user', 'Unknown')}</span>
+                    <span class="risk-badge critical">Critical - Rule Detection</span>
                 </div>
                 <div class="finding-body">
                     <table class="data-table">
-                        <tr><td>Detection Type</td><td><strong>Hybrid Credential Theft Detection</strong></td></tr>
+                        <tr><td>Detection Type</td><td><strong>Correlation Analysis</strong></td></tr>
                         <tr><td>Unique Sessions</td><td><strong>{unique_sessions}</strong></td></tr>
                         <tr><td>Unique IPs</td><td><strong>{unique_ips}</strong></td></tr>
                         <tr><td>Countries</td><td><strong>{countries_display}</strong></td></tr>
                         <tr><td>Total Events</td><td>{event_count}</td></tr>
-                        <tr><td>First Activity</td><td>{h(timestamp)}</td></tr>
-                        <tr><td>Detection Reasons</td><td>{'<br>'.join(h(r) for r in detection_reasons)}</td></tr>
+                        <tr><td>First Activity</td><td>{timestamp}</td></tr>
                         <tr><td>IP Addresses</td><td><div class="ip-list">{ip_tags}</div></td></tr>
                     </table>
-                    
-                    <h4 style="margin: 16px 0 8px 0; color: var(--primary-dark);">IP Reputation Details</h4>
-                    <div style="max-height: 300px; overflow-y: auto;">
+
+                    <h4 style="margin: 16px 0 8px 0; color: var(--primary-dark);">IP Country & Reputation</h4>
+                    <div style="max-height: 250px; overflow-y: auto;">
                         <table class="data-table" style="font-size: 12px;">
                             <thead>
                                 <tr>
                                     <th>IP Address</th>
                                     <th>Country</th>
-                                    <th>City</th>
-                                    <th>Abuse Score</th>
-                                    <th>Flags</th>
+                                    <th>IP Score</th>
                                 </tr>
                             </thead>
                             <tbody>
-                                {cred_ip_table_rows}
+                                {credential_ip_rows}
                             </tbody>
                         </table>
                     </div>
                 </div>
             </div>
 """
+
+        if rule_failed_then_success:
+            for finding in rule_failed_then_success:
+                ip_list = finding.get('ips', [])
+                ip_tags = ''.join([f'<span class="ip-tag">{ip}</span>' for ip in ip_list[:10]])
+                if len(ip_list) > 10:
+                    ip_tags += f'<span class="ip-tag">+{len(ip_list) - 10} more</span>'
+
+                failed_count = finding.get('failed_count', 'N/A')
+                first_failure = finding.get('first_failure', '')[:19].replace('T', ' ')
+                last_failure = finding.get('last_failure', '')[:19].replace('T', ' ')
+                success_time_raw = finding.get('success_time', finding.get('timestamp', ''))
+                success_timestamp = success_time_raw[:19].replace('T', ' ')
+                success_date = finding.get('success_date', success_time_raw[:10])
+                success_sessions = finding.get('success_sessions', [])
+                success_sessions_html = '<br>'.join([f'<code>{sid}</code>' for sid in success_sessions]) if success_sessions else 'N/A'
+
+                html_content += f"""
+            <div class="finding-card warning">
+                <div class="finding-header">
+                    <span class="finding-title">{finding.get('user', 'Unknown')}</span>
+                    <span class="risk-badge high">High - Suspicious Successful Login</span>
+                </div>
+                <div class="finding-body">
+                    <table class="data-table">
+                        <tr><td>Detection Type</td><td><strong>Failed Logins Followed by Success</strong></td></tr>
+                        <tr><td>Failed Attempts</td><td><strong>{failed_count}</strong></td></tr>
+                        <tr><td>First Failure</td><td>{first_failure or 'N/A'}</td></tr>
+                        <tr><td>Last Failure</td><td>{last_failure or 'N/A'}</td></tr>
+                        <tr><td>Successful Login Date</td><td><strong>{success_date or 'N/A'}</strong></td></tr>
+                        <tr><td>Successful Login Timestamp</td><td>{success_timestamp or 'N/A'}</td></tr>
+                        <tr><td>Successful Login Session IDs</td><td>{success_sessions_html}</td></tr>
+                        <tr><td>Successful Login IPs</td><td><div class="ip-list">{ip_tags}</div></td></tr>
+                    </table>
+                </div>
+            </div>
+"""
         
-        if not rule_credential_theft:
+        if not rule_credential_theft and not rule_failed_then_success:
             html_content += """
             <div class="empty-state">
                 <div class="empty-icon">&#9989;</div>
@@ -2696,7 +2725,7 @@ class RyoshiDetectionEngine:
                 suspicious_ips = finding.get('suspicious_ips', [])
                 detection_reasons = finding.get('detection_reasons', [])
                 
-                session_id = finding.get('session_id', 'Unknown')[:36]
+                session_id = finding.get('session_id', 'Unknown')
                 unique_ips = finding.get('unique_ips', len(ip_list))
                 unique_subnets = finding.get('unique_subnets_24', 'N/A')
                 event_count = finding.get('event_count', 'N/A')
@@ -2711,13 +2740,13 @@ class RyoshiDetectionEngine:
                     abuse_class = 'status-yes' if ip_info.get('abuse_score', 0) > 25 else ''
                     tor_badge = '<span class="risk-badge critical" style="font-size:10px;">TOR</span>' if ip_info.get('is_tor') else ''
                     proxy_badge = '<span class="risk-badge high" style="font-size:10px;">Proxy</span>' if ip_info.get('is_proxy') else ''
-                    country_display = h(ip_info.get('country', 'N/A') or 'N/A')
-                    city_display = h(ip_info.get('city', '') or '')
+                    country_display = ip_info.get('country', 'N/A') or 'N/A'
+                    city_display = ip_info.get('city', '') or ''
                     abuse_score = ip_info.get('abuse_score', 0)
                     abuse_display = f"{abuse_score}%" if abuse_score is not None else 'N/A'
                     ip_table_rows += f"""
                         <tr>
-                            <td><code>{h(ip_info.get('ip', ''))}</code></td>
+                            <td><code>{ip_info.get('ip', '')}</code></td>
                             <td>{country_display}</td>
                             <td>{city_display}</td>
                             <td class="{abuse_class}">{abuse_display}</td>
@@ -2726,28 +2755,28 @@ class RyoshiDetectionEngine:
                 
                 # Determine risk level
                 risk_level = 'critical' if (len(countries) > 2 or avg_abuse > 30 or len(suspicious_ips) > 3) else 'high'
-                risk_text = 'CRITICAL - Multi-Country' if finding.get('multi_country') else 'HIGH - Subnet Diversity'
+                risk_text = 'CRITICAL - Multi-Country' if finding.get('multi_country') else 'HIGH - Prefix Diversity'
                 
                 # Build countries display - handle empty list (excluded countries not shown)
-                countries_display = h(', '.join(countries)) if countries else 'Single Country'
+                countries_display = ', '.join(countries) if countries else 'Single Country'
                 
                 html_content += f"""
             <div class="finding-card {'critical' if risk_level == 'critical' else 'warning'}">
                 <div class="finding-header">
-                    <span class="finding-title">Session: {h(session_id)}...</span>
+                    <span class="finding-title">Session: <code>{session_id}</code></span>
                     <span class="risk-badge {risk_level}">{risk_text}</span>
                 </div>
                 <div class="finding-body">
                     <table class="data-table">
                         <tr><td>Detection Type</td><td><strong>Hybrid Token Theft Detection</strong></td></tr>
-                        <tr><td>Users</td><td><strong>{h(finding.get('user', 'Unknown'))}</strong></td></tr>
+                        <tr><td>Users</td><td><strong>{finding.get('user', 'Unknown')}</strong></td></tr>
                         <tr><td>Unique IPs</td><td><strong>{unique_ips}</strong></td></tr>
-                        <tr><td>Unique /24 Subnets</td><td><strong>{unique_subnets}</strong></td></tr>
+                        <tr><td>Unique Network Prefixes</td><td><strong>{unique_subnets}</strong></td></tr>
                         <tr><td>Countries</td><td><strong>{countries_display}</strong></td></tr>
                         <tr><td>Suspicious IPs (AbuseIPDB)</td><td class="{'status-yes' if suspicious_ips else ''}">{len(suspicious_ips)}</td></tr>
                         <tr><td>Avg. Abuse Score</td><td>{avg_abuse:.1f}%</td></tr>
                         <tr><td>Events</td><td>{event_count}</td></tr>
-                        <tr><td>Detection Reasons</td><td>{'<br>'.join(h(r) for r in detection_reasons)}</td></tr>
+                        <tr><td>Detection Reasons</td><td>{'<br>'.join(detection_reasons)}</td></tr>
                     </table>
                     
                     <h4 style="margin: 16px 0 8px 0; color: var(--primary-dark);">IP Reputation Details</h4>
@@ -2813,10 +2842,10 @@ class RyoshiDetectionEngine:
                 html_content += f"""
             <div class="rule-item">
                 <div class="rule-info">
-                    <div class="rule-title">{h(data['title'])}</div>
+                    <div class="rule-title">{data['title']}</div>
                     <div class="rule-count">{data['count']} matches found</div>
                 </div>
-                <span class="risk-badge {badge_class}">{h(data['severity'])}</span>
+                <span class="risk-badge {badge_class}">{data['severity']}</span>
             </div>
 """
             html_content += """
@@ -2882,7 +2911,6 @@ class RyoshiDetectionEngine:
 
     def _generate_timeline_tab_html(self):
         """Generate HTML content for the timeline tab"""
-        h = self._h  # Shorthand for HTML escaping
         # Combine all timelines
         all_events = []
         for user, timeline in self.timelines.items():
@@ -2902,12 +2930,12 @@ class RyoshiDetectionEngine:
         # Build user filter options
         user_options = '<option value="">All Users</option>'
         for user in unique_users:
-            user_options += f'<option value="{h(user)}">{h(user)}</option>'
+            user_options += f'<option value="{user}">{user}</option>'
         
         # Build operation filter options
         op_options = '<option value="">All Operations</option>'
         for op in unique_ops[:50]:  # Limit to 50 most common
-            op_options += f'<option value="{h(op)}">{h(op)}</option>'
+            op_options += f'<option value="{op}">{op}</option>'
         
         timeline_html = f"""
         <div id="timeline" class="tab-content">
@@ -2953,12 +2981,12 @@ class RyoshiDetectionEngine:
                 
                 timeline_html += f"""
                             <tr>
-                                <td>{h(timestamp)}</td>
-                                <td class="timeline-user">{h(event.get('user', ''))}</td>
-                                <td><span class="timeline-op">{h(event.get('operation', ''))}</span></td>
-                                <td>{h(workload)}</td>
-                                <td>{h(result)}</td>
-                                <td>{h(ips)}</td>
+                                <td>{timestamp}</td>
+                                <td class="timeline-user">{event.get('user', '')}</td>
+                                <td><span class="timeline-op">{event.get('operation', '')}</span></td>
+                                <td>{workload}</td>
+                                <td>{result}</td>
+                                <td>{ips}</td>
                             </tr>
 """
             
@@ -3101,8 +3129,8 @@ Examples:
     
     parser.add_argument(
         '-o', '--output',
-        default='./ryoshi_output',
-        help='Output directory for reports (default: ./ryoshi_output)'
+        default='/tmp',
+        help='Output directory for reports (default: /tmp)'
     )
     
     parser.add_argument(
@@ -3131,12 +3159,9 @@ Examples:
     abuseipdb_key = args.abuseipdb_key or os.environ.get('ABUSEIPDB_API_KEY', '')
     if abuseipdb_key:
         print("[+] AbuseIPDB integration enabled")
-        if args.abuseipdb_key:
-            print("    [!] WARNING: API key passed via command line - visible in shell history and process listings")
-            print("    [!] Recommended: use ABUSEIPDB_API_KEY environment variable instead")
     else:
         print("[*] AbuseIPDB integration disabled (no API key provided)")
-        print("    Use ABUSEIPDB_API_KEY environment variable to enable")
+        print("    Use --abuseipdb-key or set ABUSEIPDB_API_KEY environment variable")
     
     # Initialize engine with rules directory, API key, and excluded countries
     engine = RyoshiDetectionEngine(rules_dir=args.rules_dir, abuseipdb_key=abuseipdb_key, exclude_countries=args.exclude_countries)

@@ -57,7 +57,10 @@ report:
     - Time to Success: {time_to_success} minutes
     
     Successful Login Info:
+    - Date: {success_date}
+    - Timestamp: {success_timestamp}
     - IP: {success_ip}
+    - Session IDs: {success_sessions}
     - User Agent: {user_agent}
     - Device: {device_name}
     

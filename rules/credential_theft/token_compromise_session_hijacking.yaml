@@ -4,7 +4,7 @@ status: experimental
 description: |
   Detects token compromise where a single session/token is used from multiple
   geographically diverse IP addresses. Uses a hybrid detection approach:
-  1. Subnet diversity analysis (3+ distinct /24 subnets)
+  1. Network-prefix diversity analysis (3+ distinct /24 IPv4 or /64 IPv6 prefixes)
   2. Geographic impossible travel detection (multi-country access)
   3. IP reputation check via AbuseIPDB integration
   
